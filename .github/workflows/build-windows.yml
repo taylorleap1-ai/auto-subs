@@ -10,7 +10,9 @@ on:
 
 jobs:
   build-windows:
-    runs-on: windows-latest
+    # windows-2022 (Visual Studio 2022) is the well-trodden setup for the
+    # whisper.cpp native build; the newest image uses a very new Visual Studio.
+    runs-on: windows-2022
     timeout-minutes: 120
 
     steps:
@@ -41,6 +43,18 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           workspaces: AutoSubs-App/src-tauri
+
+      - name: Install the Vulkan SDK (the Windows build needs it)
+        shell: pwsh
+        run: |
+          curl.exe -fL --retry 5 -o "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan-sdk.exe"
+          Start-Process -FilePath "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" -ArgumentList "--accept-licenses","--default-answer","--confirm-command","install" -Wait
+          $sdk = Get-ChildItem C:\VulkanSDK | Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $sdk) { throw "Vulkan SDK did not install" }
+          if (-not (Test-Path "$($sdk.FullName)\Bin\glslc.exe")) { throw "glslc.exe not found in the Vulkan SDK" }
+          "VULKAN_SDK=$($sdk.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$($sdk.FullName)\Bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Write-Host "Vulkan SDK installed at $($sdk.FullName)"
 
       - name: Install JavaScript dependencies
         shell: bash
