@@ -106,7 +106,9 @@ jobs:
           arch: x64
 
       - name: Build the installer
-        shell: bash
+        # Windows command shell, NOT bash: Git Bash puts Git's own "link.exe"
+        # (a file-listing tool) ahead of Microsoft's linker and breaks the build.
+        shell: cmd
         working-directory: AutoSubs-App
         env:
           LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
