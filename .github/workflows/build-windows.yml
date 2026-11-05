@@ -96,11 +96,22 @@ jobs:
           }
           JSON
 
+      - name: Install Ninja (a simpler build tool the speech engine compiles more reliably with)
+        shell: pwsh
+        run: choco install ninja -y --no-progress
+
+      - name: Set up the Microsoft C++ compiler environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Build the installer
         shell: bash
         working-directory: AutoSubs-App
         env:
           LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
+          # Use Ninja so the nested Vulkan shader build finds the same compiler.
+          CMAKE_GENERATOR: Ninja
         run: npm run tauri build -- --bundles nsis --config ci-config.json -- --no-default-features --features windows
 
       - name: Save the installer so you can download it
