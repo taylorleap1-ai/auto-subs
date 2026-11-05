@@ -14,6 +14,10 @@ jobs:
     # whisper.cpp native build; the newest image uses a very new Visual Studio.
     runs-on: windows-2022
     timeout-minutes: 120
+    env:
+      # Windows cannot handle file paths over ~260 characters, and the speech
+      # engine's Vulkan build makes very deep ones. Build in a short folder.
+      CARGO_TARGET_DIR: 'D:\t'
 
     steps:
       - name: Keep line endings as-is (so the patch applies on Windows)
@@ -120,5 +124,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: AutoSubs-Windows-installer
-          path: AutoSubs-App/src-tauri/target/release/bundle/nsis/*.exe
+          path: D:/t/release/bundle/nsis/*.exe
           if-no-files-found: error
