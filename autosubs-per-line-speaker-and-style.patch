@@ -129,7 +129,7 @@ index 7bf2e52..e44ff9d 100644
 +const unlabeledCue = [{ ...cue('no speaker here'), speaker_id: undefined }];
 +assert.equal(preserveSubtitleEdits(unlabeledCue, [{ ...unlabeledCue[0], speaker_id: '' }]).changed, false);
 diff --git a/AutoSubs-App/src-tauri/resources/modules/autosubs_core.lua b/AutoSubs-App/src-tauri/resources/modules/autosubs_core.lua
-index 94070f5..024d038 100644
+index 94070f5..9468e09 100644
 --- a/AutoSubs-App/src-tauri/resources/modules/autosubs_core.lua
 +++ b/AutoSubs-App/src-tauri/resources/modules/autosubs_core.lua
 @@ -1403,6 +1403,73 @@ local function get_template(rootFolder, templateName, timeline)
@@ -259,7 +259,7 @@ index 94070f5..024d038 100644
  local function get_speaker_from_id(speakers, id, speakerIndexById)
      local normalizedId = normalize_speaker_id(id)
      if normalizedId == nil then return nil end
-@@ -1533,10 +1646,78 @@ local function get_speaker_from_id(speakers, id, speakerIndexById)
+@@ -1533,10 +1646,277 @@ local function get_speaker_from_id(speakers, id, speakerIndexById)
      return speakers[numericId + 1] or speakers[numericId]
  end
  
@@ -304,9 +304,11 @@ index 94070f5..024d038 100644
 +
 +-- A template's identity for comparison: every version of the bundled macro is
 +-- the same template, so an upgrade does not look like a change.
-+local function template_identity(templateName)
++local function template_identity(templateName, fitted)
 +    if caption_style.is_autosubs_template(templateName) then return "@autosubs" end
-+    return tostring(templateName)
++    -- A title whose animation is fitted to its clip differs from one that is
++    -- not, so switching it must replace the clips.
++    return tostring(templateName) .. (fitted and "|fit" or "")
 +end
 +
 +-- How a caption looks: its template, the macro settings it was given (only the
@@ -336,13 +338,211 @@ index 94070f5..024d038 100644
 +    local ok, value = pcall(function() return tool:GetData(key) end)
 +    if ok and value ~= nil and value ~= "" then return tostring(value) end
 +    return nil
++end
++
++-- Fitting a Text+ title's animation to the clip it is placed on ----------------
++-- A title is authored at one length, with an intro near the start and an outro
++-- near the end. AutoSubs places it as a window starting at the template's first
++-- frame and ending when the caption does, so on a caption shorter than the
++-- template the outro is cut off, and on a longer one it plays too early. These
++-- functions move the animation's keyframes so that the intro keeps its place at
++-- the start of the clip and the outro keeps its distance from the end.
++
++-- A template's length in seconds, or nil when Resolve does not say.
++local function template_length_seconds(templateItem, fps)
++    fps = tonumber(fps)
++    if templateItem == nil or not fps or fps <= 0 then return nil end
++    local frames = tonumber(clip_property(templateItem, "Frames"))
++    if frames and frames > 0 then return frames / fps end
++    local duration = clip_property(templateItem, "Duration")
++    if type(duration) == "string" then
++        local h, m, s, f = duration:match("^(%d+):(%d+):(%d+)[:;](%d+)$")
++        if h then
++            return tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(s) + tonumber(f) / fps
++        end
++    end
++    return nil
++end
++
++-- Where each keyframe time lands when an animation authored over
++-- `templateFrames` is fitted to a clip of `clipFrames`. Keyframes in the first
++-- half belong to the intro and stay put; those in the second half belong to the
++-- outro and move with the end of the clip. When the clip is too short for both
++-- to fit, the whole animation is squeezed proportionally instead.
++-- Returns a map from old to new time and the factor applied to handle
++-- distances, or nil when the keyframes cannot be fitted.
++local function fit_keyframe_times(times, templateFrames, clipFrames)
++    if not templateFrames or templateFrames <= 0 or not clipFrames or clipFrames < 1 then return nil end
++    local half = templateFrames / 2
++    local shift = clipFrames - templateFrames
++
++    -- Whole frames, inside the clip, in strictly increasing order.
++    local function try(mapper)
++        local mapped, previous = {}, nil
++        for _, time in ipairs(times) do
++            local moved = math.max(0, math.min(clipFrames - 1, math.floor(mapper(time) + 0.5)))
++            if previous ~= nil and moved <= previous then return nil end
++            mapped[time] = moved
++            previous = moved
++        end
++        return mapped
++    end
++
++    local mapped = try(function(time) if time <= half then return time end return time + shift end)
++    if mapped then return mapped, 1 end
++
++    local factor = clipFrames / templateFrames
++    mapped = try(function(time) return time * factor end)
++    if mapped then return mapped, factor end
++    return nil
++end
++
++-- The animation curves (BezierSplines) driving the inputs of a comp's tools.
++local function animated_splines(comp)
++    local splines, seen = {}, {}
++    local listOk, tools = pcall(function() return comp:GetToolList(false) end)
++    if not listOk or type(tools) ~= "table" then return splines end
++    for _, tool in pairs(tools) do
++        local inputsOk, inputs = pcall(function() return tool:GetInputList() end)
++        if inputsOk and type(inputs) == "table" then
++            for _, input in pairs(inputs) do
++                local outputOk, output = pcall(function() return input:GetConnectedOutput() end)
++                if outputOk and output then
++                    local modifierOk, modifier = pcall(function() return output:GetTool() end)
++                    if modifierOk and modifier then
++                        local attrsOk, attrs = pcall(function() return modifier:GetAttrs() end)
++                        if attrsOk and type(attrs) == "table" and attrs.TOOLS_RegID == "BezierSpline" then
++                            local key = tostring(attrs.TOOLS_Name or modifier)
++                            if not seen[key] then
++                                seen[key] = true
++                                splines[#splines + 1] = modifier
++                            end
++                        end
++                    end
++                end
++            end
++        end
++    end
++    return splines
++end
++
++local function keyframe_times(keyframes)
++    local times = {}
++    for time in pairs(keyframes) do
++        if type(time) == "number" then times[#times + 1] = time end
++    end
++    table.sort(times)
++    return times
++end
++
++-- Move one curve's keyframes. Returns how many it moved, or 0 and a reason.
++local function fit_spline_keyframes(spline, templateFrames, clipFrames)
++    local readOk, keyframes = pcall(function() return spline:GetKeyFrames() end)
++    if not readOk or type(keyframes) ~= "table" then return 0, "could not read its keyframes" end
++    local times = keyframe_times(keyframes)
++    if #times == 0 then return 0 end
++
++    local mapped, factor = fit_keyframe_times(times, templateFrames, clipFrames)
++    if not mapped then return 0, "the clip is too short to hold the animation" end
++    local changed = false
++    for _, time in ipairs(times) do
++        if mapped[time] ~= time then changed = true break end
++    end
++    if not changed then return 0 end
++
++    local fitted = {}
++    for _, time in ipairs(times) do
++        local keyframe, moved = keyframes[time], mapped[time]
++        local copy = {}
++        for key, value in pairs(keyframe) do copy[key] = value end
++        -- Handles are absolute times, so they travel with their keyframe.
++        for _, side in ipairs({ "LH", "RH" }) do
++            local handle = keyframe[side]
++            if type(handle) == "table" and type(handle[1]) == "number" then
++                copy[side] = { moved + (handle[1] - time) * factor, handle[2] }
++            end
++        end
++        fitted[moved] = copy
++    end
++    local writeOk, writeErr = pcall(function() return spline:SetKeyFrames(fitted, true) end)
++    if not writeOk then return 0, tostring(writeErr) end
++    return #times
++end
++
++-- Fit every animation curve in a title's comp to a clip of `clipSeconds`.
++-- Returns { curves = n, keyframes = n, reason = first problem or nil }.
++local function fit_title_keyframes(comp, templateSeconds, clipSeconds, fallbackRate)
++    local result = { curves = 0, keyframes = 0 }
++    local rateOk, rate = pcall(function() return tonumber(comp:GetPrefs("Comp.FrameFormat.Rate")) end)
++    rate = (rateOk and rate and rate > 0) and rate or tonumber(fallbackRate)
++    if not rate or not clipSeconds or clipSeconds <= 0 then
++        result.reason = "no frame rate or clip length"
++        return result
++    end
++
++    local splines = animated_splines(comp)
++    if #splines == 0 then
++        result.noCurves = true
++        return result
++    end
++    local clipFrames = math.floor(clipSeconds * rate + 0.5)
++
++    -- Resolve does not always report a template's length. Without it, assume
++    -- the outro finishes on the template's last frame.
++    local templateFrames = templateSeconds and templateSeconds * rate or nil
++    if not templateFrames then
++        local last = nil
++        for _, spline in ipairs(splines) do
++            local readOk, keyframes = pcall(function() return spline:GetKeyFrames() end)
++            if readOk and type(keyframes) == "table" then
++                local times = keyframe_times(keyframes)
++                if #times > 0 and (last == nil or times[#times] > last) then last = times[#times] end
++            end
++        end
++        templateFrames = last and (last + 1) or nil
++    end
++    if not templateFrames then
++        result.reason = "could not tell how long the title is"
++        return result
++    end
++
++    for _, spline in ipairs(splines) do
++        local moved, reason = fit_spline_keyframes(spline, templateFrames, clipFrames)
++        if moved > 0 then
++            result.curves = result.curves + 1
++            result.keyframes = result.keyframes + moved
++        elseif reason and result.reason == nil then
++            result.reason = reason
++        end
++    end
++    return result
++end
++
++-- What apply_subtitle_text needs to fit titles: aligned with the clips it is
++-- given, `which` picking a subset of clipList by index.
++local function build_fit_info(enabled, frame_rate, clipList, clipTimelineEnd, clipTemplateSeconds, which)
++    local info = { enabled = enabled, frameRate = frame_rate, clipSeconds = {}, templateSeconds = {} }
++    local function add(position, k)
++        local clip = clipList[k]
++        if clip and clipTimelineEnd[k] then
++            info.clipSeconds[position] = (clipTimelineEnd[k] - clip.recordFrame) / frame_rate
++        end
++        info.templateSeconds[position] = clipTemplateSeconds and clipTemplateSeconds[k] or nil
++    end
++    if which then
++        for position, k in ipairs(which) do add(position, k) end
++    else
++        for k = 1, #clipList do add(k, k) end
++    end
++    return info
  end
  
  local function find_subtitle_clips(timeline, transcriptId, subtitles, targetSpeakerId)
-@@ -1641,16 +1822,28 @@ end
+@@ -1641,16 +2021,31 @@ end
  --   skippedBounds      -- count of segments dropped for falling outside the
  --                         timeline (whisper can emit slightly negative starts,
  --                         and transcripts can be longer than the timeline).
++--   clipTemplateSeconds-- how long clipList[k]'s template is (nil when unknown)
 +--   clipTimelineEnd    -- clipList[k]'s end frame on the timeline (after any joining
 +--                         to the next clip), which SyncSubtitles compares with
 +--                         what is already placed.
@@ -362,6 +562,8 @@ index 94070f5..024d038 100644
      local clipSubtitleIndex = {}
 +    local clipTemplateNames = {}
 +    local clipTimelineEnd = {} -- clipList[k]'s exclusive end frame on the timeline, after joining
++    local clipTemplateSeconds = {} -- how long clipList[k]'s template is, when Resolve says
++    local templateSecondsOf = {}   -- cache: a template is measured once, not once per line
 +    local prevIndex = nil
      local skippedBounds = 0
      local prevClip, prevClipEnd = nil, nil -- last emitted clip + its exclusive end frame
@@ -369,7 +571,7 @@ index 94070f5..024d038 100644
      for i, subtitle in ipairs(subtitles) do
          -- Skip malformed segments (nil start/end) instead of crashing in to_frames().
          if subtitle["start"] == nil or subtitle["end"] == nil then
-@@ -1677,6 +1870,13 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
+@@ -1677,6 +2072,13 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
          local timeline_pos = timelineStart + start_frame
          local clip_timeline_duration = end_frame - start_frame
  
@@ -383,7 +585,7 @@ index 94070f5..024d038 100644
          -- Clips cannot start before the timeline's first frame.
          if timelineEnd and timeline_pos >= timelineEnd or timeline_pos + clip_timeline_duration <= timelineStart then
              skippedBounds = skippedBounds + 1
-@@ -1698,15 +1898,16 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
+@@ -1698,15 +2100,16 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
              local frames_between = timeline_pos - prevClipEnd
              if frames_between < joinThreshold then
                  prevClip.endFrame = math.max(1, math.floor(
@@ -403,38 +605,44 @@ index 94070f5..024d038 100644
              mediaType = 1,
              startFrame = 0,
              endFrame = duration,
-@@ -1716,7 +1917,10 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
+@@ -1716,7 +2119,14 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
  
          table.insert(clipList, newClip)
          table.insert(clipSubtitleIndex, i)
 -        prevClip, prevClipEnd = newClip, timeline_pos + clip_timeline_duration
 +        clipTemplateNames[#clipList] = lineTemplateName
 +        clipTimelineEnd[#clipList] = timeline_pos + clip_timeline_duration
++        if templateSecondsOf[lineItem] == nil then
++            templateSecondsOf[lineItem] = template_length_seconds(lineItem, lineFps) or false
++        end
++        clipTemplateSeconds[#clipList] = templateSecondsOf[lineItem] or nil
 +        prevIndex = #clipList
 +        prevClip, prevClipEnd, prevClipFps = newClip, timeline_pos + clip_timeline_duration, lineFps
          ::continue::
      end
  
-@@ -1725,7 +1929,7 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
+@@ -1725,7 +2135,7 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
              skippedBounds))
      end
  
 -    return clipList, clipSubtitleIndex, skippedBounds
-+    return clipList, clipSubtitleIndex, skippedBounds, clipTemplateNames, clipTimelineEnd
++    return clipList, clipSubtitleIndex, skippedBounds, clipTemplateNames, clipTimelineEnd, clipTemplateSeconds
  end
  
  -- Applies subtitle text + styling to each appended timeline item. Instead of
-@@ -1736,7 +1940,8 @@ end
+@@ -1736,8 +2146,10 @@ end
  -- caption_style.apply needs it to tell the bundled macro from a user's own
  -- title before running any helper the comp carries.
  local function apply_subtitle_text(timelineItems, clipCount, subtitles, clipSubtitleIndex, speakers,
 -                                   speakersExist, presetSettings, speakerIndexById, transcriptId, templateName)
 +                                   speakersExist, presetSettings, speakerIndexById, transcriptId, templateName,
-+                                   segmentPresets, presetLibrary, clipTemplateNames)
++                                   segmentPresets, presetLibrary, clipTemplateNames, fitInfo)
      local startTime = os.clock()
++    local fitted = { clips = 0, curves = 0, keyframes = 0, noCurves = 0 }
      local failed = 0
      local noFusionComp = 0
-@@ -1771,18 +1976,28 @@ local function apply_subtitle_text(timelineItems, clipCount, subtitles, clipSubt
+     local firstError = nil
+@@ -1771,18 +2183,49 @@ local function apply_subtitle_text(timelineItems, clipCount, subtitles, clipSubt
                          speaker = get_speaker_from_id(speakers, subtitle.speaker_id, speakerIndexById)
                      end
  
@@ -463,11 +671,54 @@ index 94070f5..024d038 100644
 +                    tag_subtitle_tool(styleTool, transcriptId, clipSubtitleIndex[i], subtitle.speaker_id,
 +                        content_key_for(subtitle),
 +                        style_key_for(clipTemplateName, lineSettings, speaker),
-+                        template_identity(clipTemplateName))
++                        template_identity(clipTemplateName, fitInfo and fitInfo.enabled))
++
++                    -- A user's own title carries an animation authored at its
++                    -- own length: fit it to this caption. The animated macro
++                    -- builds its keyframes from the words, so it is left alone.
++                    if fitInfo and fitInfo.enabled and not caption_style.is_autosubs_template(clipTemplateName) then
++                        local fitOk, fit = pcall(fit_title_keyframes, comp, fitInfo.templateSeconds[i],
++                            fitInfo.clipSeconds[i], fitInfo.frameRate)
++                        if fitOk and fit then
++                            if fit.keyframes > 0 then
++                                fitted.clips = fitted.clips + 1
++                                fitted.curves = fitted.curves + fit.curves
++                                fitted.keyframes = fitted.keyframes + fit.keyframes
++                            elseif fit.noCurves then
++                                fitted.noCurves = fitted.noCurves + 1
++                            elseif fit.reason then
++                                print(string.format("[AutoSubs] Title animation left as is on clip %d: %s", i, fit.reason))
++                            end
++                        elseif not fitOk then
++                            print("[AutoSubs] Title animation left as is: " .. tostring(fit))
++                        end
++                    end
  
                      timelineItem:SetClipColor("Green") -- Visualise updated clips
                  end
-@@ -1818,6 +2033,11 @@ end
+@@ -1805,10 +2248,20 @@ local function apply_subtitle_text(timelineItems, clipCount, subtitles, clipSubt
+             failed, clipCount, tostring(firstError)))
+     end
+ 
++    if fitted.noCurves > 0 then
++        print(string.format("[AutoSubs] %d title clip(s) had no keyframe curves (BezierSplines) to fit, so their animation was left as is.",
++            fitted.noCurves))
++    end
++    if fitted.keyframes > 0 then
++        print(string.format("[AutoSubs] Fitted title animation to caption length: %d keyframes on %d curves across %d clips.",
++            fitted.keyframes, fitted.curves, fitted.clips))
++    end
++
+     print(string.format("[AutoSubs] Applied subtitle text to %d clips in %.3f seconds.", clipCount - failed,
+         os.clock() - startTime))
+ 
+-    return { failed = failed, total = clipCount, firstError = firstError, noFusionComp = noFusionComp }
++    return { failed = failed, total = clipCount, firstError = firstError, noFusionComp = noFusionComp,
++        fitted = fitted }
+ end
+ 
+ -- Add subtitles to the timeline using the specified template
+@@ -1818,6 +2271,11 @@ end
  function AddSubtitles(req)
      local filePath, trackIndex, templateName = req.filePath, req.trackIndex, req.templateName
      local conflictMode, presetSettings = req.conflictMode, req.presetSettings
@@ -479,7 +730,7 @@ index 94070f5..024d038 100644
      refresh_project()
      resolve:OpenPage("edit")
  
-@@ -1845,7 +2065,7 @@ function AddSubtitles(req)
+@@ -1845,7 +2303,7 @@ function AddSubtitles(req)
              if not subtitles or #subtitles == 0 then
                  return make_error("Failed to add subtitles", "Transcript has no segments")
              end
@@ -488,7 +739,7 @@ index 94070f5..024d038 100644
              local transcriptId = get_transcript_id(data, filePath)
  
              local speakersExist = false
-@@ -1877,9 +2097,14 @@ function AddSubtitles(req)
+@@ -1877,9 +2335,15 @@ function AddSubtitles(req)
                  return make_error("Template not found", templateErr)
              end
  
@@ -500,13 +751,14 @@ index 94070f5..024d038 100644
 +            local lineTemplate = make_line_template_resolver(rootFolder, timeline, templateItem,
 +                template_frame_rate, resolvedTemplateName, segmentTemplates, segmentPresets, presetLibrary)
 +
-+            local clipList, clipSubtitleIndex, skippedBounds, clipTemplateNames = build_clip_list(subtitles,
++            local clipList, clipSubtitleIndex, skippedBounds, clipTemplateNames, clipTimelineEnd,
++            clipTemplateSeconds = build_clip_list(subtitles,
 +                speakers, speakersExist, trackIndex, templateItem, frame_rate, template_frame_rate, timelineStart,
 +                timeline:GetEndFrame(), speakerIndexById, lineTemplate)
  
              if #clipList == 0 then
                  local reason = skippedBounds > 0 and
-@@ -2059,9 +2284,13 @@ function AddSubtitles(req)
+@@ -2059,9 +2523,15 @@ function AddSubtitles(req)
              if isAnimated and font_fallback then
                  presetSettings, fontSwap = font_fallback.maybe_override(presetSettings, data["language"])
              end
@@ -514,14 +766,16 @@ index 94070f5..024d038 100644
 +            -- the batch itself is a Text+ title, so this is not tied to isAnimated.
 +            presetLibrary = localize_preset_library(presetLibrary, data["language"])
  
++            local fitInfo = build_fit_info(req.fitTitleKeyframes ~= false, frame_rate, clipList, clipTimelineEnd,
++                clipTemplateSeconds)
              local applyStats = apply_subtitle_text(timelineItems, #clipList, subtitles, clipSubtitleIndex, speakers,
 -                speakersExist, presetSettings, speakerIndexById, transcriptId, resolvedTemplateName)
 +                speakersExist, presetSettings, speakerIndexById, transcriptId, resolvedTemplateName,
-+                segmentPresets, presetLibrary, clipTemplateNames)
++                segmentPresets, presetLibrary, clipTemplateNames, fitInfo)
              if skippedBounds > 0 then
                  applyStats.failed = applyStats.failed + skippedBounds
                  applyStats.total = applyStats.total + skippedBounds
-@@ -2113,6 +2342,7 @@ end
+@@ -2113,6 +2583,7 @@ end
  
  function BatchApplyStyle(req)
      local filePath, targetSpeakerId, presetSettings = req.filePath, req.targetSpeakerId, req.presetSettings
@@ -529,7 +783,7 @@ index 94070f5..024d038 100644
      refresh_project()
  
      local data, loadErr = load_subtitle_data(req)
-@@ -2131,7 +2361,7 @@ function BatchApplyStyle(req)
+@@ -2131,7 +2602,7 @@ function BatchApplyStyle(req)
      end
  
      local speakers = data["speakers"] or {}
@@ -538,7 +792,7 @@ index 94070f5..024d038 100644
      local transcriptId = get_transcript_id(data, filePath)
      local matches, discovery = find_subtitle_clips(
          timeline,
-@@ -2144,6 +2374,7 @@ function BatchApplyStyle(req)
+@@ -2144,6 +2615,7 @@ function BatchApplyStyle(req)
      if presetSettings ~= nil and next(presetSettings) ~= nil and font_fallback then
          presetSettings, fontSwap = font_fallback.maybe_override(presetSettings, data["language"])
      end
@@ -546,7 +800,7 @@ index 94070f5..024d038 100644
  
      local updated = 0
      local skipped = 0
-@@ -2154,10 +2385,14 @@ function BatchApplyStyle(req)
+@@ -2154,10 +2626,14 @@ function BatchApplyStyle(req)
          local ok, err = pcall(function()
              local didUpdate = false
  
@@ -562,7 +816,7 @@ index 94070f5..024d038 100644
                  if next(clipSettings) ~= nil then
                      caption_style.write(match.comp, match.styleTool, clipSettings)
                      didUpdate = true
-@@ -2203,6 +2438,408 @@ function BatchApplyStyle(req)
+@@ -2203,6 +2679,413 @@ function BatchApplyStyle(req)
      }
  end
  
@@ -677,9 +931,11 @@ index 94070f5..024d038 100644
 +            end
 +            presetLibrary = localize_preset_library(presetLibrary, data["language"])
 +
-+            local clipList, clipSubtitleIndex, skippedBounds, clipTemplateNames, clipTimelineEnd = build_clip_list(
++            local clipList, clipSubtitleIndex, skippedBounds, clipTemplateNames, clipTimelineEnd,
++            clipTemplateSeconds = build_clip_list(
 +                subtitles, speakers, speakersExist, batchTrack, templateItem, frame_rate, template_frame_rate,
 +                timelineStart, timeline:GetEndFrame(), speakerIndexById, lineTemplate)
++            local fitTitles = req.fitTitleKeyframes ~= false
 +
 +            -- What each placed line should look like now.
 +            local function line_state(k)
@@ -697,7 +953,7 @@ index 94070f5..024d038 100644
 +                    speaker = speaker,
 +                    settings = settings,
 +                    templateName = lineTemplateName,
-+                    templateId = template_identity(lineTemplateName),
++                    templateId = template_identity(lineTemplateName, fitTitles),
 +                    contentKey = content_key_for(subtitle),
 +                    styleKey = style_key_for(lineTemplateName, settings, speaker),
 +                }
@@ -867,9 +1123,10 @@ index 94070f5..024d038 100644
 +
 +            -- Place the new and replacement clips as one batch, falling back to
 +            -- one append per clip if Resolve refuses the batch.
-+            local addClips, addSubtitleIndex, addTemplateNames = {}, {}, {}
++            local addClips, addSubtitleIndex, addTemplateNames, addIndices = {}, {}, {}, {}
 +            for k, clip in ipairs(clipList) do
 +                if plan[k].action == "place" then
++                    addIndices[#addIndices + 1] = k
 +                    addClips[#addClips + 1] = clip
 +                    addSubtitleIndex[#addSubtitleIndex + 1] = clipSubtitleIndex[k]
 +                    addTemplateNames[#addTemplateNames + 1] = clipTemplateNames[k]
@@ -891,9 +1148,11 @@ index 94070f5..024d038 100644
 +                        end
 +                    end
 +                end
++                local fitInfo = build_fit_info(fitTitles, frame_rate, clipList, clipTimelineEnd,
++                    clipTemplateSeconds, addIndices)
 +                local applyStats = apply_subtitle_text(placed, #addClips, subtitles, addSubtitleIndex, speakers,
 +                    speakersExist, presetSettings, speakerIndexById, transcriptId, resolvedTemplateName,
-+                    segmentPresets, presetLibrary, addTemplateNames)
++                    segmentPresets, presetLibrary, addTemplateNames, fitInfo)
 +                failed = failed + applyStats.failed
 +                if firstError == nil then firstError = applyStats.firstError end
 +            end
@@ -971,7 +1230,7 @@ index 94070f5..024d038 100644
  -- Which video track holds this item. Resolve hands back a fresh proxy on each
  -- call, so fall back to the unique id when identity comparison comes up empty.
  local function track_index_of_item(timeline, target)
-@@ -2805,6 +3442,10 @@ local handlers = {
+@@ -2805,6 +3688,10 @@ local handlers = {
          return { message = "Job completed", result = AddSubtitles(req) }
      end,
  
@@ -983,18 +1242,19 @@ index 94070f5..024d038 100644
  
      ReloadServer = function()
 diff --git a/AutoSubs-App/src/api/resolve-api.ts b/AutoSubs-App/src/api/resolve-api.ts
-index d1b7375..fb54f6c 100644
+index d1b7375..a997b86 100644
 --- a/AutoSubs-App/src/api/resolve-api.ts
 +++ b/AutoSubs-App/src/api/resolve-api.ts
-@@ -1,6 +1,7 @@
+@@ -1,6 +1,8 @@
  import { invoke } from '@tauri-apps/api/core';
  import { getSubtitleDocumentPath, getAudioExportDir } from '@/utils/file-utils';
  import { Speaker, Template, TimelineInfo } from '@/types';
 +import type { LineStyles } from '@/lib/line-styles';
++import { useSettingsStore } from '@/stores/settings-store';
  
  /**
   * Error thrown when the AutoSubs Lua server (inside Resolve) reports a failure
-@@ -223,6 +224,7 @@ export async function addSubtitlesToTimeline(
+@@ -223,6 +225,7 @@ export async function addSubtitlesToTimeline(
    outputTrack: string,
    conflictMode: ConflictMode = null,
    presetSettings?: Record<string, unknown>,
@@ -1002,7 +1262,7 @@ index d1b7375..fb54f6c 100644
  ): Promise<AddSubtitlesResult> {
    const filePath = await getSubtitleDocumentPath(filename);
    const data = await callResolve({
-@@ -232,6 +234,11 @@ export async function addSubtitlesToTimeline(
+@@ -232,6 +235,13 @@ export async function addSubtitlesToTimeline(
      trackIndex: outputTrack,
      conflictMode,
      presetSettings,
@@ -1011,10 +1271,12 @@ index d1b7375..fb54f6c 100644
 +    segmentPresets: lineStyles?.segmentPresets,
 +    presetLibrary: lineStyles?.presetLibrary,
 +    segmentTemplates: lineStyles?.segmentTemplates,
++    // Fit a Text+ title's keyframes to the length of each caption.
++    fitTitleKeyframes: useSettingsStore.getState().fitTitleKeyframes,
    });
    // Top-level failure (e.g. the server-side handler's pcall caught an error).
    throwIfError(data, 'AddSubtitles');
-@@ -242,10 +249,63 @@ export async function addSubtitlesToTimeline(
+@@ -242,10 +252,64 @@ export async function addSubtitlesToTimeline(
    return data;
  }
  
@@ -1062,6 +1324,7 @@ index d1b7375..fb54f6c 100644
 +    segmentPresets: lineStyles?.segmentPresets,
 +    presetLibrary: lineStyles?.presetLibrary,
 +    segmentTemplates: lineStyles?.segmentTemplates,
++    fitTitleKeyframes: useSettingsStore.getState().fitTitleKeyframes,
 +  });
 +  throwIfError(data, 'SyncSubtitles');
 +  if (data && typeof data === 'object' && data.result) {
@@ -1078,7 +1341,7 @@ index d1b7375..fb54f6c 100644
  ): Promise<BatchApplyStyleResult> {
    const filePath = await getSubtitleDocumentPath(filename);
    const data = await callResolve({
-@@ -253,6 +313,8 @@ export async function applyStylesToTimeline(
+@@ -253,6 +317,8 @@ export async function applyStylesToTimeline(
      filePath,
      targetSpeakerId,
      presetSettings,
@@ -1087,6 +1350,53 @@ index d1b7375..fb54f6c 100644
    });
    throwIfError(data, 'BatchApplyStyle');
    return data;
+diff --git a/AutoSubs-App/src/components/captions/caption-style-section.tsx b/AutoSubs-App/src/components/captions/caption-style-section.tsx
+index d806e82..24e8461 100644
+--- a/AutoSubs-App/src/components/captions/caption-style-section.tsx
++++ b/AutoSubs-App/src/components/captions/caption-style-section.tsx
+@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
+ 
+ import { Button } from "@/components/ui/button";
+ import { Label } from "@/components/ui/label";
++import { Switch } from "@/components/ui/switch";
+ import { Spinner } from "@/components/ui/spinner";
+ import { PresetGallery } from "@/components/captions/preset-gallery";
+ import type { CaptionPresetActions } from "@/components/captions/use-caption-presets";
+@@ -39,6 +40,7 @@ export function CaptionStyleSection({
+ }: CaptionStyleSectionProps) {
+     const { t } = useTranslation();
+     const updateSetting = useSettingsStore((s) => s.updateSetting);
++    const fitTitleKeyframes = useSettingsStore((s) => s.fitTitleKeyframes);
+ 
+     const source = captionStyle.source;
+ 
+@@ -101,6 +103,26 @@ export function CaptionStyleSection({
+                     }
+                 />
+             )}
++
++            {/* Applies to any of the user's own Text+ titles, whether chosen here
++                or pinned to individual lines. */}
++            <div className="flex items-center justify-between gap-3 rounded-lg border p-3">
++                <div className="space-y-0.5">
++                    <Label htmlFor="fit-title-keyframes" className="text-sm">
++                        {t("captions.fitKeyframes.label")}
++                    </Label>
++                    <p className="text-xs text-muted-foreground">
++                        {t("captions.fitKeyframes.description")}
++                    </p>
++                </div>
++                <Switch
++                    id="fit-title-keyframes"
++                    checked={fitTitleKeyframes}
++                    onCheckedChange={(checked: boolean) =>
++                        updateSetting("fitTitleKeyframes", checked)
++                    }
++                />
++            </div>
+         </section>
+     );
+ }
 diff --git a/AutoSubs-App/src/components/captions/output-panel.tsx b/AutoSubs-App/src/components/captions/output-panel.tsx
 index 334ac22..c7680df 100644
 --- a/AutoSubs-App/src/components/captions/output-panel.tsx
@@ -1836,7 +2146,7 @@ index b810376..b32bdbb 100644
        flushPendingSubtitleSave,
        processTranscriptionResults,
 diff --git a/AutoSubs-App/src/i18n/locales/de/translation.json b/AutoSubs-App/src/i18n/locales/de/translation.json
-index 179e8a2..de268b0 100644
+index 179e8a2..5b7c042 100644
 --- a/AutoSubs-App/src/i18n/locales/de/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/de/translation.json
 @@ -487,6 +487,12 @@
@@ -1852,7 +2162,7 @@ index 179e8a2..de268b0 100644
      "previousSubtitles": "Untertitelverlauf",
      "empty": {
        "noSubtitlesAvailable": "Deine Untertitel werden hier angezeigt, sobald die Transkription abgeschlossen ist"
-@@ -637,6 +643,22 @@
+@@ -637,6 +643,26 @@
        "partial": "{{updated}} aktualisiert, {{failed}} fehlgeschlagen",
        "failed": "Timeline-Stile konnten nicht geändert werden"
      },
@@ -1872,11 +2182,15 @@ index 179e8a2..de268b0 100644
 +        "removed": "{{count}} entfernt"
 +      }
 +    },
++    "fitKeyframes": {
++      "label": "Titel-Animation an die Untertitellänge anpassen",
++      "description": "Verschiebt die Keyframes deiner Text+-Titel, damit das Intro am Anfang jedes Untertitels und das Outro an seinem Ende abläuft."
++    },
      "send": {
        "adding": "Wird gesendet...",
        "placedPartial": "{{placed}} von {{total}} Untertiteln platziert",
 diff --git a/AutoSubs-App/src/i18n/locales/en/translation.json b/AutoSubs-App/src/i18n/locales/en/translation.json
-index f59edad..37b1b67 100644
+index f59edad..198fa90 100644
 --- a/AutoSubs-App/src/i18n/locales/en/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/en/translation.json
 @@ -507,6 +507,12 @@
@@ -1892,7 +2206,7 @@ index f59edad..37b1b67 100644
      "previousSubtitles": "Subtitle History",
      "empty": {
        "noSubtitlesAvailable": "Your subtitles will appear here when finished transcribing"
-@@ -657,6 +663,22 @@
+@@ -657,6 +663,26 @@
        "partial": "Updated {{updated}} clips, {{failed}} failed",
        "failed": "Couldn't update timeline styles"
      },
@@ -1912,11 +2226,15 @@ index f59edad..37b1b67 100644
 +        "removed": "{{count}} removed"
 +      }
 +    },
++    "fitKeyframes": {
++      "label": "Fit title animation to caption length",
++      "description": "Moves the keyframes of your Text+ titles so the intro plays at the start of each caption and the outro at its end."
++    },
      "send": {
        "adding": "Sending...",
        "placedPartial": "Placed {{placed}} of {{total}} subtitles",
 diff --git a/AutoSubs-App/src/i18n/locales/es/translation.json b/AutoSubs-App/src/i18n/locales/es/translation.json
-index 8db6c5d..54bf661 100644
+index 8db6c5d..919daac 100644
 --- a/AutoSubs-App/src/i18n/locales/es/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/es/translation.json
 @@ -487,6 +487,12 @@
@@ -1932,7 +2250,7 @@ index 8db6c5d..54bf661 100644
      "previousSubtitles": "Historial de subtítulos",
      "empty": {
        "noSubtitlesAvailable": "Tus subtítulos aparecerán aquí cuando termine la transcripción"
-@@ -637,6 +643,22 @@
+@@ -637,6 +643,26 @@
        "partial": "{{updated}} actualizados, {{failed}} con error",
        "failed": "No se pudieron actualizar los estilos"
      },
@@ -1952,11 +2270,15 @@ index 8db6c5d..54bf661 100644
 +        "removed": "{{count}} eliminados"
 +      }
 +    },
++    "fitKeyframes": {
++      "label": "Ajustar la animación del título a la duración del subtítulo",
++      "description": "Mueve los fotogramas clave de tus títulos Text+ para que la entrada ocurra al inicio de cada subtítulo y la salida al final."
++    },
      "send": {
        "adding": "Enviando...",
        "placedPartial": "Colocados {{placed}} de {{total}} subtítulos",
 diff --git a/AutoSubs-App/src/i18n/locales/fr/translation.json b/AutoSubs-App/src/i18n/locales/fr/translation.json
-index eaf79f0..8a9a317 100644
+index eaf79f0..1c83ecd 100644
 --- a/AutoSubs-App/src/i18n/locales/fr/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/fr/translation.json
 @@ -487,6 +487,12 @@
@@ -1972,7 +2294,7 @@ index eaf79f0..8a9a317 100644
      "previousSubtitles": "Historique des sous-titres",
      "empty": {
        "noSubtitlesAvailable": "Vos sous-titres apparaîtront ici une fois la transcription terminée"
-@@ -637,6 +643,22 @@
+@@ -637,6 +643,26 @@
        "partial": "{{updated}} actualisés, {{failed}} en échec",
        "failed": "Impossible d’actualiser les styles"
      },
@@ -1992,11 +2314,15 @@ index eaf79f0..8a9a317 100644
 +        "removed": "{{count}} supprimés"
 +      }
 +    },
++    "fitKeyframes": {
++      "label": "Adapter l'animation du titre à la durée du sous-titre",
++      "description": "Déplace les images clés de vos titres Text+ pour que l'intro se joue au début de chaque sous-titre et l'outro à sa fin."
++    },
      "send": {
        "adding": "Envoi en cours...",
        "placedPartial": "{{placed}} sous-titres placés sur {{total}}",
 diff --git a/AutoSubs-App/src/i18n/locales/ja/translation.json b/AutoSubs-App/src/i18n/locales/ja/translation.json
-index 1bfdb8d..7424a75 100644
+index 1bfdb8d..45c757e 100644
 --- a/AutoSubs-App/src/i18n/locales/ja/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/ja/translation.json
 @@ -504,6 +504,12 @@
@@ -2012,7 +2338,7 @@ index 1bfdb8d..7424a75 100644
      "previousSubtitles": "字幕履歴",
      "status": {
        "count_one": "字幕 {{count}} 件",
-@@ -637,6 +643,22 @@
+@@ -637,6 +643,26 @@
        "partial": "{{updated}}件更新、{{failed}}件失敗",
        "failed": "タイムラインのスタイルを更新できませんでした"
      },
@@ -2032,11 +2358,15 @@ index 1bfdb8d..7424a75 100644
 +        "removed": "{{count}} 件削除"
 +      }
 +    },
++    "fitKeyframes": {
++      "label": "タイトルのアニメーションを字幕の長さに合わせる",
++      "description": "Text+ タイトルのキーフレームを移動し、イントロを各字幕の先頭で、アウトロを末尾で再生します。"
++    },
      "send": {
        "adding": "送信中...",
        "placedPartial": "{{total}}件中{{placed}}件の字幕を配置しました",
 diff --git a/AutoSubs-App/src/i18n/locales/ko/translation.json b/AutoSubs-App/src/i18n/locales/ko/translation.json
-index e3bf390..048f55d 100644
+index e3bf390..0e48750 100644
 --- a/AutoSubs-App/src/i18n/locales/ko/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/ko/translation.json
 @@ -503,6 +503,12 @@
@@ -2052,7 +2382,7 @@ index e3bf390..048f55d 100644
      "previousSubtitles": "자막 기록",
      "waitingForSubtitles": "자막을 기다리는 중...",
      "status": {
-@@ -637,6 +643,22 @@
+@@ -637,6 +643,26 @@
        "partial": "{{updated}}개 업데이트, {{failed}}개 실패",
        "failed": "타임라인 스타일을 업데이트하지 못했습니다"
      },
@@ -2072,11 +2402,15 @@ index e3bf390..048f55d 100644
 +        "removed": "{{count}}개 삭제"
 +      }
 +    },
++    "fitKeyframes": {
++      "label": "제목 애니메이션을 자막 길이에 맞추기",
++      "description": "Text+ 제목의 키프레임을 이동해 인트로는 각 자막의 시작에서, 아웃트로는 끝에서 재생되도록 합니다."
++    },
      "send": {
        "adding": "전송 중...",
        "placedPartial": "자막 {{total}}개 중 {{placed}}개 배치",
 diff --git a/AutoSubs-App/src/i18n/locales/ru/translation.json b/AutoSubs-App/src/i18n/locales/ru/translation.json
-index 7eeafc1..c56872b 100644
+index 7eeafc1..bfe3226 100644
 --- a/AutoSubs-App/src/i18n/locales/ru/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/ru/translation.json
 @@ -497,6 +497,12 @@
@@ -2092,7 +2426,7 @@ index 7eeafc1..c56872b 100644
      "previousSubtitles": "История субтитров",
      "empty": {
        "noSubtitlesAvailable": "Здесь появятся субтитры после завершения транскрибации"
-@@ -647,6 +653,22 @@
+@@ -647,6 +653,26 @@
        "partial": "Обновлено: {{updated}}, ошибок: {{failed}}",
        "failed": "Не удалось обновить стили таймлайна"
      },
@@ -2112,11 +2446,15 @@ index 7eeafc1..c56872b 100644
 +        "removed": "удалено: {{count}}"
 +      }
 +    },
++    "fitKeyframes": {
++      "label": "Подгонять анимацию титра под длину субтитра",
++      "description": "Сдвигает ключевые кадры ваших титров Text+, чтобы вступление проигрывалось в начале каждого субтитра, а завершение — в конце."
++    },
      "send": {
        "adding": "Отправка...",
        "placedPartial": "Размещено {{placed}} из {{total}} субтитров",
 diff --git a/AutoSubs-App/src/i18n/locales/zh/translation.json b/AutoSubs-App/src/i18n/locales/zh/translation.json
-index dbaea54..4e4e628 100644
+index dbaea54..ecfe991 100644
 --- a/AutoSubs-App/src/i18n/locales/zh/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/zh/translation.json
 @@ -487,6 +487,12 @@
@@ -2132,7 +2470,7 @@ index dbaea54..4e4e628 100644
      "previousSubtitles": "字幕历史",
      "empty": {
        "noSubtitlesAvailable": "转录完成后，字幕将显示在这里"
-@@ -637,6 +643,22 @@
+@@ -637,6 +643,26 @@
        "partial": "已更新 {{updated}} 个，失败 {{failed}} 个",
        "failed": "无法更新时间线样式"
      },
@@ -2151,6 +2489,10 @@ index dbaea54..4e4e628 100644
 +        "restyled": "更新样式 {{count}} 条",
 +        "removed": "删除 {{count}} 条"
 +      }
++    },
++    "fitKeyframes": {
++      "label": "使标题动画适应字幕时长",
++      "description": "移动 Text+ 标题的关键帧，使开场动画在每条字幕开头播放，结束动画在末尾播放。"
 +    },
      "send": {
        "adding": "正在发送...",
@@ -2274,8 +2616,20 @@ index 0000000..3d4e2ce
 +        ? { segmentPresets, presetLibrary, segmentTemplates }
 +        : undefined;
 +}
+diff --git a/AutoSubs-App/src/stores/settings-store.ts b/AutoSubs-App/src/stores/settings-store.ts
+index bd45123..b71f575 100644
+--- a/AutoSubs-App/src/stores/settings-store.ts
++++ b/AutoSubs-App/src/stores/settings-store.ts
+@@ -78,6 +78,7 @@ export const DEFAULT_SETTINGS: Settings = {
+ 
+   // Caption style
+   captionStyle: { source: "autosubs", presetId: DEFAULT_PRESET_ID },
++  fitTitleKeyframes: true,
+ };
+ 
+ // ─── Persisted-shape normalisation ────────────────────────────────────────
 diff --git a/AutoSubs-App/src/types.ts b/AutoSubs-App/src/types.ts
-index 7056ae6..babf0e1 100644
+index 7056ae6..a78d0dc 100644
 --- a/AutoSubs-App/src/types.ts
 +++ b/AutoSubs-App/src/types.ts
 @@ -69,6 +69,17 @@ export type DraftSubtitle = Omit<Subtitle, 'id'> & {
@@ -2296,6 +2650,17 @@ index 7056ae6..babf0e1 100644
  export interface Sample {
      start: number;
      end: number;
+@@ -183,6 +194,10 @@ export interface Settings {
+ 
+     // Caption style: which of the two kinds of caption to send, and which one.
+     captionStyle: CaptionStyle;
++
++    // Move the keyframes of the user's own Text+ titles so the intro plays at the
++    // start of each caption and the outro at its end, whatever its length.
++    fitTitleKeyframes: boolean;
+ }
+ 
+ /**
 diff --git a/AutoSubs-App/src/utils/export-file.ts b/AutoSubs-App/src/utils/export-file.ts
 index aa6baea..0609caf 100644
 --- a/AutoSubs-App/src/utils/export-file.ts
@@ -2471,7 +2836,7 @@ index 0c2f602..eab30de 100644
  
    for (const subtitle of normalizedSubtitles) {
 diff --git a/AutoSubs-App/tests/mock_resolve_test.lua b/AutoSubs-App/tests/mock_resolve_test.lua
-index d7006f8..afba199 100644
+index d7006f8..57a2514 100644
 --- a/AutoSubs-App/tests/mock_resolve_test.lua
 +++ b/AutoSubs-App/tests/mock_resolve_test.lua
 @@ -23,6 +23,7 @@ local function make_tool()
@@ -2482,7 +2847,37 @@ index d7006f8..afba199 100644
      return tool
  end
  
-@@ -142,9 +143,27 @@ local function make_media_pool(timeline, opts)
+@@ -127,6 +128,29 @@ local function make_timeline(opts)
+     return tl
+ end
+ 
++-- A Fusion animation curve. keyframes is { [time] = { value, LH = {t, v}, RH = {t, v} } }.
++local function make_spline(keyframes, name, regId)
++    local spline = { _kf = keyframes, _name = name }
++    function spline:GetKeyFrames() return self._kf end
++    function spline:SetKeyFrames(kf)
++        if self.failWrite then error("Fusion refused the keyframes") end
++        self._kf = kf
++        self.writes = (self.writes or 0) + 1
++    end
++    function spline:GetAttrs() return { TOOLS_RegID = regId or "BezierSpline", TOOLS_Name = name } end
++    return spline
++end
++-- Hang curves off a comp the way Fusion exposes them: tool -> input -> connected output -> modifier.
++local function attach_splines(comp, splines)
++    local inputs = {}
++    for _, spline in ipairs(splines) do
++        inputs[#inputs + 1] = { GetConnectedOutput = function() return { GetTool = function() return spline end } end }
++    end
++    inputs[#inputs + 1] = { GetConnectedOutput = function() return nil end } -- an input with no animation
++    local tool = { GetInputList = function() return inputs end }
++    comp.GetToolList = function() return { tool } end
++end
++
+ local function make_media_pool(timeline, opts)
+     opts = opts or {}
+     local mp = { tl = timeline, templateFPS = opts.templateFPS or 24 }
+@@ -142,9 +166,29 @@ local function make_media_pool(timeline, opts)
          GetUniqueId = function() return "tpl-1" end,
      }
      mp.templateClip = templateClip
@@ -2497,6 +2892,8 @@ index d7006f8..afba199 100644
 +                if k == "Clip Name" then return name end
 +                if k == "FPS" then return tostring(mp.templateFPS) end
 +                if k == "Type" then return "Fusion Title" end
++                if k == "Frames" and mp.titleFrames and mp.titleFrames[name] then return tostring(mp.titleFrames[name]) end
++                if k == "Duration" and mp.titleDuration and mp.titleDuration[name] then return mp.titleDuration[name] end
 +            end,
 +            GetUniqueId = function() return "tpl-" .. name end,
 +        }
@@ -2511,7 +2908,7 @@ index d7006f8..afba199 100644
          GetName = function() return "Master" end,
      }
      function mp:GetRootFolder() return rootFolder end
-@@ -182,8 +201,15 @@ local function make_media_pool(timeline, opts)
+@@ -182,8 +226,22 @@ local function make_media_pool(timeline, opts)
              elseif blocked then
                  results[i] = dead_handle()
              else
@@ -2522,13 +2919,20 @@ index d7006f8..afba199 100644
 +                        if ci.mediaPoolItem == titleClip then comp.tools.AutoSubs = nil end
 +                    end
 +                end
++                local isTitle = false
++                for _, titleClip in pairs(self.extraClipByName) do
++                    if ci.mediaPoolItem == titleClip then isTitle = true end
++                end
++                if self.titleSplines and (isTitle or self.splinesOnAll) then
++                    attach_splines(comp, self.titleSplines())
++                end
 +                local item = make_item(s, e, self.noComps and nil or comp)
                  item._sourceTrack = ci.trackIndex
 +                item._source = ci.mediaPoolItem
                  table.insert(track.items, item and { handle = item } or nil)
                  results[i] = item
              end
-@@ -747,5 +773,540 @@ do
+@@ -747,5 +805,747 @@ do
      check_marker_move(2, 50, 38, "marker move with lead-in")
  end
  
@@ -3064,6 +3468,213 @@ index d7006f8..afba199 100644
 +        check(second and second._comp.tools.AutoSubs._data.AutoSubsSegmentIndex == 2,
 +            "sync/renumber: the clip's tag follows its new position",
 +            second and tostring(second._comp.tools.AutoSubs._data.AutoSubsSegmentIndex))
++    end
++end
++
++-- Fitting a title's animation to the caption it is placed on --------------------
++do
++    local function seg(id, s_, e, text)
++        return { id = id, start = s_, ["end"] = e, text = text or ("line " .. id), words = {} }
++    end
++    local function fresh(poolOpts)
++        tl = make_timeline { trackCount = 1 }
++        mp = make_media_pool(tl, poolOpts or {})
++        wire_project(tl, mp)
++    end
++    local function request(func, segs, extra)
++        local r = {
++            func = func,
++            filePath = "/tmp/luatest/tx.json",
++            trackIndex = "1",
++            templateName = "Big Yellow",
++            subtitleData = { transcriptId = "tx-1", segments = segs },
++            presetSettings = { Font = "Batch" },
++        }
++        for k, v in pairs(extra or {}) do r[k] = v end
++        return r
++    end
++    local function send(segs, extra) return AddSubtitles(request("AddSubtitles", segs, extra)) end
++    local function sync(segs, extra) return SyncSubtitles(request("SyncSubtitles", segs, extra)) end
++    local function times_of(spline)
++        local times = {}
++        for t in pairs(spline._kf) do times[#times + 1] = t end
++        table.sort(times)
++        return times
++    end
++    local function same(a, b)
++        if #a ~= #b then return false end
++        for i = 1, #a do if a[i] ~= b[i] then return false end end
++        return true
++    end
++    local function show(list) return "{" .. table.concat(list, ",") .. "}" end
++
++    -- An intro (0 to 10) and an outro (100 to 119) on a 5 second, 24 fps title.
++    local function curve()
++        return {
++            [0] = { 0 },
++            [10] = { 1, RH = { 13, 1 } },
++            [100] = { 1, LH = { 97, 1 } },
++            [119] = { 0 },
++        }
++    end
++    -- Three captions of the same length, far enough apart not to be joined.
++    local function captions(seconds)
++        local gap = seconds + 2
++        return { seg(0, 0, seconds), seg(1, gap, gap + seconds), seg(2, gap * 2, gap * 2 + seconds) }
++    end
++    local created
++    local function title_pool(extra)
++        local opts = { extraClips = { "Big Yellow" }, titleFrames = { ["Big Yellow"] = 120 } }
++        for k, v in pairs(extra or {}) do opts[k] = v end
++        fresh(opts)
++        mp.bareTitles = true
++        created = {}
++        mp.titleSplines = function()
++            local sp = make_spline(curve(), "Opacity" .. (#created + 1))
++            created[#created + 1] = sp
++            return { sp }
++        end
++    end
++
++    -- A caption shorter than the title: the intro stays, the outro moves up to the end.
++    do
++        print("\n=== keyframes: shorter caption ===")
++        title_pool()
++        local r = send(captions(1.5))
++        check(r.ok == true, "keyframes/short: sent", tostring(r.error))
++        check(#created == 3, "keyframes/short: three title clips placed", #created)
++        local got = times_of(created[1])
++        check(same(got, { 0, 10, 16, 35 }), "keyframes/short: intro kept, outro moved to the end", show(got))
++        check(created[1]._kf[16][1] == 1 and created[1]._kf[35][1] == 0, "keyframes/short: values travel with their keyframes")
++        check(same(times_of(created[3]), { 0, 10, 16, 35 }), "keyframes/short: every clip is fitted")
++    end
++
++    -- Handles move with their keyframe.
++    do
++        print("\n=== keyframes: handles ===")
++        title_pool()
++        send(captions(1.5))
++        local kf = created[1]._kf
++        check(kf[10].RH[1] == 13 and kf[10].RH[2] == 1, "keyframes/handles: an intro handle is unmoved")
++        check(kf[16].LH and kf[16].LH[1] == 13 and kf[16].LH[2] == 1,
++            "keyframes/handles: an outro handle keeps its distance", kf[16].LH and tostring(kf[16].LH[1]))
++    end
++
++    -- Too short for both: the animation is squeezed to fit.
++    do
++        print("\n=== keyframes: very short caption ===")
++        title_pool()
++        local r = send(captions(20 / 24))
++        check(r.ok == true, "keyframes/tiny: sent", tostring(r.error))
++        local got = times_of(created[1])
++        check(same(got, { 0, 2, 17, 19 }), "keyframes/tiny: squeezed proportionally", show(got))
++    end
++
++    -- A caption longer than the title: the outro waits for the end.
++    do
++        print("\n=== keyframes: longer caption ===")
++        title_pool()
++        send(captions(10))
++        local got = times_of(created[1])
++        check(same(got, { 0, 10, 220, 239 }), "keyframes/long: outro pushed out to the end", show(got))
++    end
++
++    -- Switched off: nothing is touched.
++    do
++        print("\n=== keyframes: switched off ===")
++        title_pool()
++        local r = send(captions(1.5), { fitTitleKeyframes = false })
++        check(r.ok == true and created[1].writes == nil, "keyframes/off: animation left exactly as authored")
++        check(same(times_of(created[1]), { 0, 10, 100, 119 }), "keyframes/off: times unchanged")
++    end
++
++    -- The animated macro builds its own keyframes, so it is never retimed.
++    do
++        print("\n=== keyframes: the macro is left alone ===")
++        title_pool()
++        mp.splinesOnAll = true
++        local r = send(captions(1.5), { templateName = "AutoSubs Caption 2026-09-17" })
++        check(r.ok == true and #created >= 1, "keyframes/macro: sent with curves present", tostring(r.error))
++        local touched = 0
++        for _, sp in ipairs(created) do if sp.writes then touched = touched + 1 end end
++        check(touched == 0, "keyframes/macro: none of its curves were retimed", touched)
++    end
++
++    -- Resolve not reporting the template length: assume the outro ends on its last frame.
++    do
++        print("\n=== keyframes: template length unknown ===")
++        title_pool { titleFrames = {} }
++        send(captions(1.5))
++        check(same(times_of(created[1]), { 0, 10, 16, 35 }), "keyframes/unknown: inferred from the animation itself",
++            show(times_of(created[1])))
++    end
++    -- ...or reporting it as a timecode.
++    do
++        print("\n=== keyframes: template length as a timecode ===")
++        title_pool { titleFrames = {}, titleDuration = { ["Big Yellow"] = "00:00:05:00" } }
++        send(captions(1.5))
++        check(same(times_of(created[1]), { 0, 10, 16, 35 }), "keyframes/timecode: read from Duration",
++            show(times_of(created[1])))
++    end
++
++    -- Curves that are not Bezier splines are not touched; the ones that are, are.
++    do
++        print("\n=== keyframes: other curve types ===")
++        title_pool()
++        mp.titleSplines = function()
++            local bezier = make_spline(curve(), "Opacity")
++            local path = make_spline(curve(), "Path", "XYPath")
++            created[#created + 1] = bezier
++            created[#created + 1] = path
++            return { bezier, path }
++        end
++        send(captions(1.5))
++        check(created[1].writes == 1 and created[2].writes == nil, "keyframes/types: only the Bezier spline is retimed")
++    end
++
++    -- A curve Fusion will not write to must not stop the caption being placed.
++    do
++        print("\n=== keyframes: a refused write ===")
++        title_pool()
++        mp.titleSplines = function()
++            local sp = make_spline(curve(), "Opacity")
++            sp.failWrite = true
++            created[#created + 1] = sp
++            return { sp }
++        end
++        local r = send(captions(1.5))
++        check(r.ok == true and (r.failed or 0) == 0, "keyframes/refused: the send still succeeds", tostring(r.error))
++        check(#tl.tracks[1].items == 3, "keyframes/refused: all three captions are on the timeline", #tl.tracks[1].items)
++        check(same(times_of(created[1]), { 0, 10, 100, 119 }), "keyframes/refused: the curve is left as it was")
++    end
++
++    -- Syncing: a caption whose length changed is placed again and fitted to its new length.
++    do
++        print("\n=== keyframes: sync after a caption changes length ===")
++        title_pool()
++        send(captions(1.5))
++        created = {}
++        local longer = captions(1.5)
++        longer[2]["end"] = longer[2].start + 2.5 -- 60 frames instead of 36
++        local r = sync(longer)
++        check(r.ok == true and r.replaced == 1 and r.unchanged == 2, "keyframes/sync: only the changed caption is replaced",
++            tostring(r.error) .. " replaced=" .. tostring(r.replaced) .. " unchanged=" .. tostring(r.unchanged))
++        check(#created == 1 and same(times_of(created[1]), { 0, 10, 40, 59 }),
++            "keyframes/sync: and its animation is fitted to the new length", created[1] and show(times_of(created[1])))
++    end
++
++    -- Syncing: turning the setting off replaces the fitted clips so they match.
++    do
++        print("\n=== keyframes: sync after switching the setting off ===")
++        title_pool()
++        send(captions(1.5))
++        created = {}
++        local r = sync(captions(1.5), { fitTitleKeyframes = false })
++        check(r.ok == true and r.replaced == 3, "keyframes/toggle: all three clips are replaced", tostring(r.error) .. " " .. tostring(r.replaced))
++        check(#created == 3 and same(times_of(created[1]), { 0, 10, 100, 119 }),
++            "keyframes/toggle: and come back as authored", created[1] and show(times_of(created[1])))
++        local again = sync(captions(1.5), { fitTitleKeyframes = false })
++        check(again.ok == true and again.unchanged == 3, "keyframes/toggle: a second sync changes nothing", tostring(again.unchanged))
 +    end
 +end
 +
