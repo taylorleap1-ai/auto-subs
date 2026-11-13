@@ -109,6 +109,20 @@ jobs:
         with:
           arch: x64
 
+      - name: Create folders the ONNX runtime's build script expects
+        shell: pwsh
+        run: |
+          # The speech-recognition libraries copy a Windows DLL into "examples"
+          # and "deps" folders found by counting three levels up from their work
+          # folder. With Cargo's newer folder layout that count lands one level
+          # too high, on folders that do not exist, and the build stops. Making
+          # them first lets the copy succeed with either layout. (The DLL is not
+          # part of the installer; the app uses the one that ships with Windows.)
+          $build = Join-Path $env:CARGO_TARGET_DIR "release\build"
+          New-Item -ItemType Directory -Force -Path (Join-Path $build "examples") | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $build "deps") | Out-Null
+          Get-ChildItem $build | ForEach-Object { Write-Host "Created: $($_.FullName)" }
+
       - name: Build the installer
         # Windows command shell, NOT bash: Git Bash puts Git's own "link.exe"
         # (a file-listing tool) ahead of Microsoft's linker and breaks the build.
