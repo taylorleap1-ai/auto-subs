@@ -129,7 +129,7 @@ index 7bf2e52..e44ff9d 100644
 +const unlabeledCue = [{ ...cue('no speaker here'), speaker_id: undefined }];
 +assert.equal(preserveSubtitleEdits(unlabeledCue, [{ ...unlabeledCue[0], speaker_id: '' }]).changed, false);
 diff --git a/AutoSubs-App/src-tauri/resources/modules/autosubs_core.lua b/AutoSubs-App/src-tauri/resources/modules/autosubs_core.lua
-index 94070f5..677e5c0 100644
+index 94070f5..a36f8a1 100644
 --- a/AutoSubs-App/src-tauri/resources/modules/autosubs_core.lua
 +++ b/AutoSubs-App/src-tauri/resources/modules/autosubs_core.lua
 @@ -1403,6 +1403,73 @@ local function get_template(rootFolder, templateName, timeline)
@@ -259,7 +259,7 @@ index 94070f5..677e5c0 100644
  local function get_speaker_from_id(speakers, id, speakerIndexById)
      local normalizedId = normalize_speaker_id(id)
      if normalizedId == nil then return nil end
-@@ -1533,10 +1646,463 @@ local function get_speaker_from_id(speakers, id, speakerIndexById)
+@@ -1533,10 +1646,422 @@ local function get_speaker_from_id(speakers, id, speakerIndexById)
      return speakers[numericId + 1] or speakers[numericId]
  end
  
@@ -343,7 +343,7 @@ index 94070f5..677e5c0 100644
 +-- What the title-animation fitting did, in words. Resolve's free edition does
 +-- not show a script's output anywhere the user can read it, so the lines are
 +-- also collected, returned with the result, and shown by the app.
-+local KEYFRAME_FIT_VERSION = "Keyframe fitting v2 (Fusion AdjustKeyFrames, every result checked)"
++local KEYFRAME_FIT_VERSION = "Keyframe fitting v3 (curve rewritten with relative handles, every result checked)"
 +
 +local function new_fit_log()
 +    return { remaining = 2, contextRemaining = 2, lines = {}, chars = 0 }
@@ -471,54 +471,42 @@ index 94070f5..677e5c0 100644
 +    return plan.op == "scale" and plan.x or 1
 +end
 +
-+-- Fusion's own operation for moving a range of keyframes, handles included.
-+local function adjust_with_fusion(spline, plan, undo)
-+    local slack = 1e-6
-+    if plan.op == "offset" then
-+        if undo then
-+            return spline:AdjustKeyFrames(plan.first + plan.x - slack, plan.last + plan.x + slack, -plan.x, 0, "offset")
-+        end
-+        return spline:AdjustKeyFrames(plan.first - slack, plan.last + slack, plan.x, 0, "offset")
-+    end
-+    if undo then
-+        return spline:AdjustKeyFrames(plan.first * plan.x - slack, plan.last * plan.x + slack, 1 / plan.x, 1, "scale", 0, 0)
-+    end
-+    return spline:AdjustKeyFrames(plan.first - slack, plan.last + slack, plan.x, 1, "scale", 0, 0)
-+end
-+
-+-- The same move done by rewriting the whole curve, for a Fusion without
-+-- AdjustKeyFrames, or one whose AdjustKeyFrames did not do what it should.
++-- A keyframe's handles are stored relative to the keyframe: LH and RH are
++-- { frames, value } offsets from it (a left handle has negative frames). So
++-- moving a keyframe in time leaves its handles' numbers exactly as they are, and
++-- squeezing time scales only their frames. (Fusion's own AdjustKeyFrames is not
++-- used: it adds the move onto those offsets, which bends the curve.)
 +local function rebuild_with_keyframes(spline, original, plan)
 +    local factor = plan_factor(plan)
 +    local rebuilt = {}
 +    for _, time in ipairs(keyframe_times(original)) do
-+        local keyframe, moved = original[time], planned_time(plan, time)
++        local keyframe = original[time]
 +        local copy = {}
 +        for key, value in pairs(keyframe) do copy[key] = value end
-+        -- Handles are absolute positions, so they travel with their keyframe.
 +        for _, side in ipairs({ "LH", "RH" }) do
 +            local handle = keyframe[side]
 +            if type(handle) == "table" and type(handle[1]) == "number" then
-+                copy[side] = { moved + (handle[1] - time) * factor, handle[2] }
++                copy[side] = { handle[1] * factor, handle[2] }
 +            end
 +        end
-+        rebuilt[moved] = copy
++        rebuilt[planned_time(plan, time)] = copy
 +    end
 +    return spline:SetKeyFrames(rebuilt, true)
 +end
 +
-+-- Handles that cross their neighbours make a curve loop back on itself.
++-- A left handle must point back in time and a right handle forward. One that
++-- points the wrong way makes the curve loop back on itself. (A handle longer than
++-- the gap to its neighbour is not counted: shrinking a hold between intro and
++-- outro makes that happen legitimately, and on a flat stretch it does no harm.)
 +local function count_crossed_handles(keyframes)
-+    local times, crossed = keyframe_times(keyframes), 0
-+    for i, time in ipairs(times) do
++    local crossed = 0
++    for _, time in ipairs(keyframe_times(keyframes)) do
 +        local keyframe = keyframes[time]
 +        local left, right = keyframe.LH, keyframe.RH
-+        if type(left) == "table" and type(left[1]) == "number"
-+            and (left[1] > time + 1e-6 or (times[i - 1] and left[1] < times[i - 1] - 1e-6)) then
++        if type(left) == "table" and type(left[1]) == "number" and left[1] > 1e-6 then
 +            crossed = crossed + 1
 +        end
-+        if type(right) == "table" and type(right[1]) == "number"
-+            and (right[1] < time - 1e-6 or (times[i + 1] and right[1] > times[i + 1] + 1e-6)) then
++        if type(right) == "table" and type(right[1]) == "number" and right[1] < -1e-6 then
 +            crossed = crossed + 1
 +        end
 +    end
@@ -545,10 +533,10 @@ index 94070f5..677e5c0 100644
 +                if type(handleIs) ~= "table" or type(handleIs[1]) ~= "number" then
 +                    return false, "a handle was lost"
 +                end
-+                local wanted = (handleWas[1] - time) * factor
-+                local got = handleIs[1] - after[i]
-+                if math.abs(got - wanted) > 0.05 + 0.02 * math.abs(wanted) then
-+                    return false, string.format("a handle is %.2f frames from its keyframe instead of %.2f", got, wanted)
++                local wanted = handleWas[1] * factor
++                if math.abs(handleIs[1] - wanted) > 0.01 + 0.01 * math.abs(wanted) then
++                    return false, string.format("a %s handle reaches %.2f frames from its keyframe instead of %.2f",
++                        side, handleIs[1], wanted)
 +                end
 +                if math.abs((handleIs[2] or 0) - (handleWas[2] or 0)) > 1e-4 then
 +                    return false, "a handle's height changed"
@@ -557,12 +545,13 @@ index 94070f5..677e5c0 100644
 +        end
 +    end
 +    if count_crossed_handles(now) > count_crossed_handles(original) then
-+        return false, "the handles now cross, which makes the curve loop"
++        return false, "the handles now point the wrong way, which makes the curve loop"
 +    end
 +    return true
 +end
 +
-+-- A curve's keyframes on one line, for the console.
++-- A curve's keyframes on one line, for the report. Handles are shown as the
++-- offsets Fusion stores: RH(frames after, value change), LH(frames before, ...).
 +local function describe_keyframes(keyframes)
 +    local parts = {}
 +    for _, time in ipairs(keyframe_times(keyframes)) do
@@ -576,8 +565,8 @@ index 94070f5..677e5c0 100644
 +end
 +
 +-- Move one curve's keyframes. Returns how many it moved, or 0 and a reason.
-+-- Whatever is done is read back and checked, and undone if it is not right, so
-+-- a curve is never left damaged.
++-- The result is read back and checked, and the curve is put back as it was if it
++-- is not right, so a curve is never left damaged.
 +local function fit_spline_keyframes(spline, templateFrames, clipFrames, name, log)
 +    local readOk, original = pcall(function() return spline:GetKeyFrames() end)
 +    if not readOk or type(original) ~= "table" then return 0, "could not read its keyframes" end
@@ -588,59 +577,29 @@ index 94070f5..677e5c0 100644
 +    if not plan then return 0, "the clip is too short to hold the animation" end
 +    if plan.op == "none" then return 0 end
 +
-+    local function show(label)
++    local writeOk, writeErr = pcall(rebuild_with_keyframes, spline, original, plan)
++    if not writeOk then return 0, "could not rewrite the curve: " .. tostring(writeErr) end
++
++    local readBackOk, now = pcall(function() return spline:GetKeyFrames() end)
++    local good, why
++    if readBackOk and type(now) == "table" then
++        good, why = check_fit(original, now, plan)
++    else
++        now, good, why = nil, false, "could not read the curve back"
++    end
++    if good then
 +        if log and log.remaining > 0 then
 +            log.remaining = log.remaining - 1
-+            report_line(log, label)
++            report_line(log, string.format("Fitted '%s': %s  ->  %s", name, describe_keyframes(original),
++                describe_keyframes(now)))
 +        end
-+    end
-+    local function read_now()
-+        local ok, now = pcall(function() return spline:GetKeyFrames() end)
-+        if ok and type(now) == "table" then return now end
-+        return nil
-+    end
-+    local problems = {}
-+
-+    -- First choice: Fusion's own AdjustKeyFrames.
-+    do
-+        local moveOk, moveErr = pcall(adjust_with_fusion, spline, plan, false)
-+        if moveOk then
-+            local now = read_now()
-+            local good, why
-+            if now then good, why = check_fit(original, now, plan) else good, why = false, "could not read the curve back" end
-+            if good then
-+                show(string.format("Fitted '%s': %s  ->  %s", name, describe_keyframes(original), describe_keyframes(now)))
-+                return #times
-+            end
-+            problems[#problems + 1] = "AdjustKeyFrames: " .. tostring(why)
-+            -- Put it back before trying anything else.
-+            if not pcall(adjust_with_fusion, spline, plan, true) then
-+                pcall(function() return spline:SetKeyFrames(original, true) end)
-+            end
-+        else
-+            problems[#problems + 1] = "AdjustKeyFrames failed: " .. tostring(moveErr)
-+        end
++        return #times
 +    end
 +
-+    -- Second choice: rewrite the curve.
-+    local rewriteOk, rewriteErr = pcall(rebuild_with_keyframes, spline, original, plan)
-+    if rewriteOk then
-+        local now = read_now()
-+        local good, why
-+        if now then good, why = check_fit(original, now, plan) else good, why = false, "could not read the curve back" end
-+        if good then
-+            show(string.format("Fitted '%s': %s  ->  %s", name, describe_keyframes(original), describe_keyframes(now)))
-+            return #times
-+        end
-+        problems[#problems + 1] = "rewriting the curve: " .. tostring(why)
-+        report_line(log, string.format("Curve '%s' did not come out right, so it was restored.  Before: %s   After: %s",
-+            name, describe_keyframes(original), now and describe_keyframes(now) or "(unreadable)"))
-+        pcall(function() return spline:SetKeyFrames(original, true) end)
-+    else
-+        problems[#problems + 1] = "rewriting the curve failed: " .. tostring(rewriteErr)
-+    end
-+
-+    return 0, table.concat(problems, "; ")
++    report_line(log, string.format("Curve '%s' did not come out right (%s), so it was restored.  Before: %s   After: %s",
++        name, tostring(why), describe_keyframes(original), now and describe_keyframes(now) or "(unreadable)"))
++    pcall(function() return spline:SetKeyFrames(original, true) end)
++    return 0, tostring(why)
 +end
 +
 +-- Fit every animation curve in a title's comp to a clip of `clipSeconds`.
@@ -724,7 +683,7 @@ index 94070f5..677e5c0 100644
  end
  
  local function find_subtitle_clips(timeline, transcriptId, subtitles, targetSpeakerId)
-@@ -1641,16 +2207,31 @@ end
+@@ -1641,16 +2166,31 @@ end
  --   skippedBounds      -- count of segments dropped for falling outside the
  --                         timeline (whisper can emit slightly negative starts,
  --                         and transcripts can be longer than the timeline).
@@ -757,7 +716,7 @@ index 94070f5..677e5c0 100644
      for i, subtitle in ipairs(subtitles) do
          -- Skip malformed segments (nil start/end) instead of crashing in to_frames().
          if subtitle["start"] == nil or subtitle["end"] == nil then
-@@ -1677,6 +2258,13 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
+@@ -1677,6 +2217,13 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
          local timeline_pos = timelineStart + start_frame
          local clip_timeline_duration = end_frame - start_frame
  
@@ -771,7 +730,7 @@ index 94070f5..677e5c0 100644
          -- Clips cannot start before the timeline's first frame.
          if timelineEnd and timeline_pos >= timelineEnd or timeline_pos + clip_timeline_duration <= timelineStart then
              skippedBounds = skippedBounds + 1
-@@ -1698,15 +2286,16 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
+@@ -1698,15 +2245,16 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
              local frames_between = timeline_pos - prevClipEnd
              if frames_between < joinThreshold then
                  prevClip.endFrame = math.max(1, math.floor(
@@ -791,7 +750,7 @@ index 94070f5..677e5c0 100644
              mediaType = 1,
              startFrame = 0,
              endFrame = duration,
-@@ -1716,7 +2305,14 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
+@@ -1716,7 +2264,14 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
  
          table.insert(clipList, newClip)
          table.insert(clipSubtitleIndex, i)
@@ -807,7 +766,7 @@ index 94070f5..677e5c0 100644
          ::continue::
      end
  
-@@ -1725,7 +2321,7 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
+@@ -1725,7 +2280,7 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
              skippedBounds))
      end
  
@@ -816,7 +775,7 @@ index 94070f5..677e5c0 100644
  end
  
  -- Applies subtitle text + styling to each appended timeline item. Instead of
-@@ -1736,8 +2332,10 @@ end
+@@ -1736,8 +2291,10 @@ end
  -- caption_style.apply needs it to tell the bundled macro from a user's own
  -- title before running any helper the comp carries.
  local function apply_subtitle_text(timelineItems, clipCount, subtitles, clipSubtitleIndex, speakers,
@@ -828,7 +787,7 @@ index 94070f5..677e5c0 100644
      local failed = 0
      local noFusionComp = 0
      local firstError = nil
-@@ -1771,18 +2369,50 @@ local function apply_subtitle_text(timelineItems, clipCount, subtitles, clipSubt
+@@ -1771,18 +2328,50 @@ local function apply_subtitle_text(timelineItems, clipCount, subtitles, clipSubt
                          speaker = get_speaker_from_id(speakers, subtitle.speaker_id, speakerIndexById)
                      end
  
@@ -883,7 +842,7 @@ index 94070f5..677e5c0 100644
  
                      timelineItem:SetClipColor("Green") -- Visualise updated clips
                  end
-@@ -1805,10 +2435,22 @@ local function apply_subtitle_text(timelineItems, clipCount, subtitles, clipSubt
+@@ -1805,10 +2394,22 @@ local function apply_subtitle_text(timelineItems, clipCount, subtitles, clipSubt
              failed, clipCount, tostring(firstError)))
      end
  
@@ -907,7 +866,7 @@ index 94070f5..677e5c0 100644
  end
  
  -- Add subtitles to the timeline using the specified template
-@@ -1818,6 +2460,11 @@ end
+@@ -1818,6 +2419,11 @@ end
  function AddSubtitles(req)
      local filePath, trackIndex, templateName = req.filePath, req.trackIndex, req.templateName
      local conflictMode, presetSettings = req.conflictMode, req.presetSettings
@@ -919,7 +878,7 @@ index 94070f5..677e5c0 100644
      refresh_project()
      resolve:OpenPage("edit")
  
-@@ -1845,7 +2492,7 @@ function AddSubtitles(req)
+@@ -1845,7 +2451,7 @@ function AddSubtitles(req)
              if not subtitles or #subtitles == 0 then
                  return make_error("Failed to add subtitles", "Transcript has no segments")
              end
@@ -928,7 +887,7 @@ index 94070f5..677e5c0 100644
              local transcriptId = get_transcript_id(data, filePath)
  
              local speakersExist = false
-@@ -1877,9 +2524,15 @@ function AddSubtitles(req)
+@@ -1877,9 +2483,15 @@ function AddSubtitles(req)
                  return make_error("Template not found", templateErr)
              end
  
@@ -947,7 +906,7 @@ index 94070f5..677e5c0 100644
  
              if #clipList == 0 then
                  local reason = skippedBounds > 0 and
-@@ -2059,9 +2712,15 @@ function AddSubtitles(req)
+@@ -2059,9 +2671,15 @@ function AddSubtitles(req)
              if isAnimated and font_fallback then
                  presetSettings, fontSwap = font_fallback.maybe_override(presetSettings, data["language"])
              end
@@ -964,7 +923,7 @@ index 94070f5..677e5c0 100644
              if skippedBounds > 0 then
                  applyStats.failed = applyStats.failed + skippedBounds
                  applyStats.total = applyStats.total + skippedBounds
-@@ -2086,7 +2745,8 @@ function AddSubtitles(req)
+@@ -2086,7 +2704,8 @@ function AddSubtitles(req)
                      total = applyStats.total,
                      noFusionComp = applyStats.noFusionComp,
                      skipped = skippedBounds,
@@ -974,7 +933,7 @@ index 94070f5..677e5c0 100644
                  }
              elseif applyStats and applyStats.failed == applyStats.total and applyStats.total > 0 then
                  local short = string.format("Failed to place all %d subtitles", applyStats.total)
-@@ -2099,7 +2759,7 @@ function AddSubtitles(req)
+@@ -2099,7 +2718,7 @@ function AddSubtitles(req)
                  return make_error(short, applyStats.firstError, errCode)
              end
  
@@ -983,7 +942,7 @@ index 94070f5..677e5c0 100644
          end)() -- end of inner placement function
      end)
  
-@@ -2113,6 +2773,7 @@ end
+@@ -2113,6 +2732,7 @@ end
  
  function BatchApplyStyle(req)
      local filePath, targetSpeakerId, presetSettings = req.filePath, req.targetSpeakerId, req.presetSettings
@@ -991,7 +950,7 @@ index 94070f5..677e5c0 100644
      refresh_project()
  
      local data, loadErr = load_subtitle_data(req)
-@@ -2131,7 +2792,7 @@ function BatchApplyStyle(req)
+@@ -2131,7 +2751,7 @@ function BatchApplyStyle(req)
      end
  
      local speakers = data["speakers"] or {}
@@ -1000,7 +959,7 @@ index 94070f5..677e5c0 100644
      local transcriptId = get_transcript_id(data, filePath)
      local matches, discovery = find_subtitle_clips(
          timeline,
-@@ -2144,6 +2805,7 @@ function BatchApplyStyle(req)
+@@ -2144,6 +2764,7 @@ function BatchApplyStyle(req)
      if presetSettings ~= nil and next(presetSettings) ~= nil and font_fallback then
          presetSettings, fontSwap = font_fallback.maybe_override(presetSettings, data["language"])
      end
@@ -1008,7 +967,7 @@ index 94070f5..677e5c0 100644
  
      local updated = 0
      local skipped = 0
-@@ -2154,10 +2816,14 @@ function BatchApplyStyle(req)
+@@ -2154,10 +2775,14 @@ function BatchApplyStyle(req)
          local ok, err = pcall(function()
              local didUpdate = false
  
@@ -1024,7 +983,7 @@ index 94070f5..677e5c0 100644
                  if next(clipSettings) ~= nil then
                      caption_style.write(match.comp, match.styleTool, clipSettings)
                      didUpdate = true
-@@ -2203,6 +2869,416 @@ function BatchApplyStyle(req)
+@@ -2203,6 +2828,416 @@ function BatchApplyStyle(req)
      }
  end
  
@@ -1441,7 +1400,7 @@ index 94070f5..677e5c0 100644
  -- Which video track holds this item. Resolve hands back a fresh proxy on each
  -- call, so fall back to the unique id when identity comparison comes up empty.
  local function track_index_of_item(timeline, target)
-@@ -2805,6 +3881,10 @@ local handlers = {
+@@ -2805,6 +3840,10 @@ local handlers = {
          return { message = "Job completed", result = AddSubtitles(req) }
      end,
  
@@ -3172,7 +3131,7 @@ index 0c2f602..eab30de 100644
  
    for (const subtitle of normalizedSubtitles) {
 diff --git a/AutoSubs-App/tests/mock_resolve_test.lua b/AutoSubs-App/tests/mock_resolve_test.lua
-index d7006f8..c00883f 100644
+index d7006f8..9b60472 100644
 --- a/AutoSubs-App/tests/mock_resolve_test.lua
 +++ b/AutoSubs-App/tests/mock_resolve_test.lua
 @@ -23,6 +23,7 @@ local function make_tool()
@@ -3183,15 +3142,16 @@ index d7006f8..c00883f 100644
      return tool
  end
  
-@@ -127,6 +128,88 @@ local function make_timeline(opts)
+@@ -127,6 +128,71 @@ local function make_timeline(opts)
      return tl
  end
  
-+-- A Fusion animation curve. keyframes is { [time] = { value, LH = {t, v}, RH = {t, v} } }.
-+-- opts.adjust picks how AdjustKeyFrames behaves: "faithful" (the default, as documented:
-+-- keyframes and their handles move together), "ignoreHandles" (moves keyframes only),
-+-- "corrupt" (flips the handles), or false (the method does not exist, like an old Fusion).
-+-- opts.corruptFirstWrite makes the first SetKeyFrames store flipped handles.
++-- A Fusion animation curve. keyframes is { [time] = { value, LH = {dt, dv}, RH = {dt, dv} } }.
++-- Handles are RELATIVE to their keyframe: { frames, value } offsets, a left handle having
++-- negative frames. (Real Fusion reports them this way.)
++-- opts.corruptFirstWrite makes the first SetKeyFrames store handles pointing the wrong way.
++-- AdjustKeyFrames behaves as real Fusion's does: it adds the move onto the handle offsets as if
++-- they were absolute, which bends a curve. The code must never call it, and `adjusts` counts calls.
 +local function make_spline(keyframes, name, regId, opts)
 +    opts = opts or {}
 +    local spline = { _kf = keyframes, _name = name, adjusts = 0 }
@@ -3212,48 +3172,30 @@ index d7006f8..c00883f 100644
 +        local stored = copy_all(kf)
 +        if opts.corruptFirstWrite and not self._corrupted then
 +            self._corrupted = true
-+            for t, k in pairs(stored) do
-+                if k.LH then k.LH[1] = t + 50 end
-+                if k.RH then k.RH[1] = t - 50 end
++            for _, k in pairs(stored) do
++                if k.LH then k.LH[1] = 50 end
++                if k.RH then k.RH[1] = -50 end
 +            end
 +        end
 +        self._kf = stored
 +        self.writes = (self.writes or 0) + 1
 +    end
-+    local mode = opts.adjust
-+    if mode == nil then mode = "faithful" end
-+    if mode ~= false then
-+        function spline:AdjustKeyFrames(first, last, x, y, op, px, py)
-+            if self.failAdjust then error("AdjustKeyFrames is not available here") end
-+            self.adjusts = self.adjusts + 1
-+            px, py = px or 0, py or 0
-+            local moved = {}
-+            for t, k in pairs(self._kf) do
-+                if t >= first and t <= last then
-+                    local nt, c = t, {}
-+                    for key, value in pairs(k) do c[key] = value end
-+                    if op == "offset" then nt = t + x else nt = px + (t - px) * x end
-+                    for _, side in ipairs({ "LH", "RH" }) do
-+                        if k[side] then
-+                            local hx, hy = k[side][1], k[side][2]
-+                            if mode == "ignoreHandles" then
-+                                c[side] = { hx, hy }
-+                            elseif mode == "corrupt" then
-+                                c[side] = { nt + (side == "LH" and 60 or -60), hy }
-+                            elseif op == "offset" then
-+                                c[side] = { hx + x, hy + y }
-+                            else
-+                                c[side] = { px + (hx - px) * x, py + (hy - py) * y }
-+                            end
-+                        end
-+                    end
-+                    moved[nt] = c
-+                else
-+                    moved[t] = k
++    function spline:AdjustKeyFrames(first, last, x, y, op)
++        self.adjusts = self.adjusts + 1
++        local moved = {}
++        for t, k in pairs(self._kf) do
++            if t >= first and t <= last then
++                local c = {}
++                for key, value in pairs(k) do c[key] = value end
++                for _, side in ipairs({ "LH", "RH" }) do
++                    if k[side] then c[side] = { k[side][1] + x, k[side][2] + y } end
 +                end
++                moved[op == "offset" and t + x or t * x] = c
++            else
++                moved[t] = k
 +            end
-+            self._kf = moved
 +        end
++        self._kf = moved
 +    end
 +    function spline:GetAttrs() return { TOOLS_RegID = regId or "BezierSpline", TOOLS_Name = name } end
 +    return spline
@@ -3272,7 +3214,7 @@ index d7006f8..c00883f 100644
  local function make_media_pool(timeline, opts)
      opts = opts or {}
      local mp = { tl = timeline, templateFPS = opts.templateFPS or 24 }
-@@ -142,9 +225,29 @@ local function make_media_pool(timeline, opts)
+@@ -142,9 +208,29 @@ local function make_media_pool(timeline, opts)
          GetUniqueId = function() return "tpl-1" end,
      }
      mp.templateClip = templateClip
@@ -3303,7 +3245,7 @@ index d7006f8..c00883f 100644
          GetName = function() return "Master" end,
      }
      function mp:GetRootFolder() return rootFolder end
-@@ -182,8 +285,22 @@ local function make_media_pool(timeline, opts)
+@@ -182,8 +268,22 @@ local function make_media_pool(timeline, opts)
              elseif blocked then
                  results[i] = dead_handle()
              else
@@ -3327,7 +3269,7 @@ index d7006f8..c00883f 100644
                  table.insert(track.items, item and { handle = item } or nil)
                  results[i] = item
              end
-@@ -747,5 +864,912 @@ do
+@@ -747,5 +847,880 @@ do
      check_marker_move(2, 50, 38, "marker move with lead-in")
  end
  
@@ -3901,11 +3843,15 @@ index d7006f8..c00883f 100644
 +        for i = 1, #a do if a[i] ~= b[i] then return false end end
 +        return true
 +    end
-+    local function show(list) return "{" .. table.concat(list, ",") .. "}" end
 +    local function near(a, b)
 +        if #a ~= #b then return false end
 +        for i = 1, #a do if math.abs(a[i] - b[i]) > 0.01 then return false end end
 +        return true
++    end
++    local function show(list) return "{" .. table.concat(list, ",") .. "}" end
++    -- A handle { dt, dv } compared with a tolerance.
++    local function handle_is(h, dt, dv)
++        return h ~= nil and math.abs(h[1] - dt) < 0.001 and math.abs(h[2] - dv) < 0.001
 +    end
 +    -- Two curves are identical: same keyframes, values and handles.
 +    local function same_curve(a, b)
@@ -3922,32 +3868,60 @@ index d7006f8..c00883f 100644
 +        return true
 +    end
 +
-+    -- An intro (0 to 10) and an outro (100 to 119) on a 5 second, 24 fps title.
++    -- A title with an intro (frames 0 to 10) and an outro (100 to 119) over 120 frames, its
++    -- outro the mirror of its intro: steep at the end, like the title this was reported on.
 +    local function curve()
 +        return {
-+            [0] = { 0 },
-+            [10] = { 1, RH = { 13, 1 } },
-+            [100] = { 1, LH = { 97, 1 } },
-+            [119] = { 0 },
++            [0] = { 0, RH = { 0.2, 1.4 } },
++            [10] = { 1, LH = { -3, 0 }, RH = { 5, 0 } },
++            [100] = { 1, LH = { -26, 0 }, RH = { 8, 0 } },
++            [119] = { 0, LH = { -0.2, 1.39 } },
 +        }
 +    end
-+    -- Three captions of the same length, far enough apart not to be joined.
++    -- Captions of the same length, far enough apart not to be joined.
 +    local function captions(seconds)
 +        local gap = seconds + 2
 +        return { seg(0, 0, seconds), seg(1, gap, gap + seconds), seg(2, gap * 2, gap * 2 + seconds) }
 +    end
 +    local created
-+    local function title_pool(extra)
-+        local opts = { extraClips = { "Big Yellow" }, titleFrames = { ["Big Yellow"] = 120 } }
-+        for k, v in pairs(extra or {}) do opts[k] = v end
-+        fresh(opts)
++    local function title_pool(extra, makeCurve, opts)
++        local poolOpts = { extraClips = { "Big Yellow" }, titleFrames = { ["Big Yellow"] = 120 } }
++        for k, v in pairs(extra or {}) do poolOpts[k] = v end
++        fresh(poolOpts)
 +        mp.bareTitles = true
 +        created = {}
 +        mp.titleSplines = function()
-+            local sp = make_spline(curve(), "Opacity" .. (#created + 1))
++            local sp = make_spline((makeCurve or curve)(), "Opacity" .. (#created + 1), nil, opts)
 +            created[#created + 1] = sp
 +            return { sp }
 +        end
++    end
++
++    -- THE TITLE THIS WAS REPORTED ON: 99 frames, a caption of 113. The outro moves 14 frames
++    -- later and every handle keeps exactly the numbers it had. (A handle's numbers are offsets
++    -- from its keyframe; adding the move to them is what bent the curve.)
++    do
++        print("\n=== keyframes: the reported title ===")
++        local function reported()
++            return {
++                [0] = { 0, RH = { 0.2, 1.4 } },
++                [7] = { 1, LH = { -7.94, -0.005 }, RH = { 12.68, 0 } },
++                [88] = { 1, LH = { -26.2, -5e-15 }, RH = { 8, 0 } },
++                [98] = { 0, LH = { -0.2, 1.39 } },
++            }
++        end
++        title_pool({ titleFrames = { ["Big Yellow"] = 99 } }, reported)
++        local r = send({ seg(0, 0, 113 / 24) })
++        check(r.ok == true and #created == 1, "keyframes/reported: sent", tostring(r.error))
++        local sp = created[1]
++        check(same(times_of(sp), { 0, 7, 102, 112 }), "keyframes/reported: outro moved 14 frames later", show(times_of(sp)))
++        check(handle_is(sp._kf[0].RH, 0.2, 1.4) and handle_is(sp._kf[7].LH, -7.94, -0.005)
++            and handle_is(sp._kf[7].RH, 12.68, 0), "keyframes/reported: intro handles untouched")
++        check(handle_is(sp._kf[102].LH, -26.2, -5e-15) and handle_is(sp._kf[102].RH, 8, 0),
++            "keyframes/reported: outro handles keep their numbers")
++        check(handle_is(sp._kf[112].LH, -0.2, 1.39),
++            "keyframes/reported: the last handle still points back and steeply down, mirroring the intro")
++        check(sp.adjusts == 0, "keyframes/reported: Fusion's AdjustKeyFrames is not used", sp.adjusts)
 +    end
 +
 +    -- A caption shorter than the title: the intro stays, the outro moves up to the end.
@@ -3959,22 +3933,14 @@ index d7006f8..c00883f 100644
 +        check(#created == 3, "keyframes/short: three title clips placed", #created)
 +        local got = times_of(created[1])
 +        check(same(got, { 0, 10, 16, 35 }), "keyframes/short: intro kept, outro moved to the end", show(got))
-+        check(created[1]._kf[16][1] == 1 and created[1]._kf[35][1] == 0, "keyframes/short: values travel with their keyframes")
++        local kf = created[1]._kf
++        check(kf[16][1] == 1 and kf[35][1] == 0, "keyframes/short: values travel with their keyframes")
++        check(handle_is(kf[16].LH, -26, 0) and handle_is(kf[35].LH, -0.2, 1.39),
++            "keyframes/short: and handles keep their numbers, whichever way the move goes")
 +        check(same(times_of(created[3]), { 0, 10, 16, 35 }), "keyframes/short: every clip is fitted")
 +    end
 +
-+    -- Handles move with their keyframe.
-+    do
-+        print("\n=== keyframes: handles ===")
-+        title_pool()
-+        send(captions(1.5))
-+        local kf = created[1]._kf
-+        check(kf[10].RH[1] == 13 and kf[10].RH[2] == 1, "keyframes/handles: an intro handle is unmoved")
-+        check(kf[16].LH and kf[16].LH[1] == 13 and kf[16].LH[2] == 1,
-+            "keyframes/handles: an outro handle keeps its distance", kf[16].LH and tostring(kf[16].LH[1]))
-+    end
-+
-+    -- Too short for both: the animation is squeezed to fit.
++    -- Too short for both: the animation is squeezed, handles' reach shrinking with it.
 +    do
 +        print("\n=== keyframes: very short caption ===")
 +        title_pool()
@@ -3982,8 +3948,9 @@ index d7006f8..c00883f 100644
 +        check(r.ok == true, "keyframes/tiny: sent", tostring(r.error))
 +        local got = times_of(created[1])
 +        check(near(got, { 0, 10 / 6, 100 / 6, 119 / 6 }), "keyframes/tiny: squeezed proportionally", show(got))
-+        check(created[1]._kf[times_of(created[1])[3]].LH[1] < times_of(created[1])[3],
-+            "keyframes/tiny: and its handles still point the right way")
++        local kf = created[1]._kf
++        check(handle_is(kf[got[3]].LH, -26 / 6, 0) and handle_is(kf[got[4]].LH, -0.2 / 6, 1.39),
++            "keyframes/tiny: handle reach scales with time, their height does not")
 +    end
 +
 +    -- A caption longer than the title: the outro waits for the end.
@@ -3993,6 +3960,7 @@ index d7006f8..c00883f 100644
 +        send(captions(10))
 +        local got = times_of(created[1])
 +        check(same(got, { 0, 10, 220, 239 }), "keyframes/long: outro pushed out to the end", show(got))
++        check(handle_is(created[1]._kf[220].LH, -26, 0), "keyframes/long: handles keep their numbers")
 +    end
 +
 +    -- Switched off: nothing is touched.
@@ -4012,7 +3980,7 @@ index d7006f8..c00883f 100644
 +        local r = send(captions(1.5), { templateName = "AutoSubs Caption 2026-09-17" })
 +        check(r.ok == true and #created >= 1, "keyframes/macro: sent with curves present", tostring(r.error))
 +        local touched = 0
-+        for _, sp in ipairs(created) do if sp.writes then touched = touched + 1 end end
++        for _, sp in ipairs(created) do if sp.writes or sp.adjusts > 0 then touched = touched + 1 end end
 +        check(touched == 0, "keyframes/macro: none of its curves were retimed", touched)
 +    end
 +
@@ -4045,7 +4013,7 @@ index d7006f8..c00883f 100644
 +            return { bezier, path }
 +        end
 +        send(captions(1.5))
-+        check(created[1].adjusts == 1 and created[2].adjusts == 0, "keyframes/types: only the Bezier spline is retimed")
++        check(created[1].writes == 1 and created[2].writes == nil, "keyframes/types: only the Bezier spline is retimed")
 +    end
 +
 +    -- A curve Fusion will not write to must not stop the caption being placed.
@@ -4055,7 +4023,6 @@ index d7006f8..c00883f 100644
 +        mp.titleSplines = function()
 +            local sp = make_spline(curve(), "Opacity")
 +            sp.failWrite = true
-+            sp.failAdjust = true
 +            created[#created + 1] = sp
 +            return { sp }
 +        end
@@ -4065,123 +4032,75 @@ index d7006f8..c00883f 100644
 +        check(same(times_of(created[1]), { 0, 10, 100, 119 }), "keyframes/refused: the curve is left as it was")
 +    end
 +
-+    -- Fusion's own AdjustKeyFrames is used when it behaves as documented.
-+    do
-+        print("\n=== keyframes: AdjustKeyFrames ===")
-+        title_pool()
-+        local r = send(captions(1.5))
-+        check(r.ok == true and created[1].adjusts == 1 and created[1].writes == nil,
-+            "keyframes/adjust: one AdjustKeyFrames call, no rewrite of the curve")
-+    end
-+
-+    -- A Fusion without AdjustKeyFrames: the curve is rewritten instead, correctly.
-+    do
-+        print("\n=== keyframes: no AdjustKeyFrames ===")
-+        title_pool()
-+        mp.titleSplines = function()
-+            local sp = make_spline(curve(), "Opacity", nil, { adjust = false })
-+            created[#created + 1] = sp
-+            return { sp }
-+        end
-+        local r = send(captions(1.5))
-+        check(r.ok == true and created[1].writes == 1, "keyframes/rewrite: the curve is rewritten", tostring(r.error))
-+        local kf = created[1]._kf
-+        check(same(times_of(created[1]), { 0, 10, 16, 35 }) and kf[16].LH[1] == 13 and kf[35][1] == 0,
-+            "keyframes/rewrite: with the right times and handles", show(times_of(created[1])))
-+    end
-+
-+    -- AdjustKeyFrames that leaves the handles behind is noticed and undone; the
-+    -- rewrite then does the job.
-+    do
-+        print("\n=== keyframes: AdjustKeyFrames leaves handles behind ===")
-+        title_pool()
-+        mp.titleSplines = function()
-+            local sp = make_spline(curve(), "Opacity", nil, { adjust = "ignoreHandles" })
-+            created[#created + 1] = sp
-+            return { sp }
-+        end
-+        local r = send(captions(1.5))
-+        local kf = created[1]._kf
-+        check(r.ok == true and created[1].writes == 1, "keyframes/ignore: falls back to rewriting the curve", tostring(r.error))
-+        check(same(times_of(created[1]), { 0, 10, 16, 35 }) and kf[16].LH[1] == 13,
-+            "keyframes/ignore: and ends up correct", show(times_of(created[1])))
-+    end
-+
-+    -- THE FAILURE SEEN IN FUSION: a rewrite that mangles the handles makes the
-+    -- outro loop. It must be detected and the curve put back exactly as it was.
++    -- A rewrite that mangles the handles makes the outro loop. It must be noticed and the
++    -- curve put back exactly as it was.
 +    do
 +        print("\n=== keyframes: a rewrite that damages the curve ===")
-+        title_pool()
-+        mp.titleSplines = function()
-+            local sp = make_spline(curve(), "Opacity", nil, { adjust = false, corruptFirstWrite = true })
-+            created[#created + 1] = sp
-+            return { sp }
-+        end
++        title_pool(nil, nil, { corruptFirstWrite = true })
 +        local r = send(captions(1.5))
 +        check(r.ok == true and (r.failed or 0) == 0, "keyframes/damage: the send still succeeds", tostring(r.error))
 +        check(same_curve(created[1], make_spline(curve(), "x")), "keyframes/damage: the curve is restored exactly as authored")
++        check((r.keyframeReport or ""):find("did not come out right", 1, true) ~= nil,
++            "keyframes/damage: and the report says so", tostring(r.keyframeReport))
 +    end
 +
-+    -- Both ways of moving the curve go wrong: still nothing is left damaged.
++    -- The same fit read back with the OLD, wrong idea of handles would have passed; the check
++    -- must instead catch handles that no longer match what was authored.
 +    do
-+        print("\n=== keyframes: every way goes wrong ===")
++        print("\n=== keyframes: handles that drifted ===")
 +        title_pool()
 +        mp.titleSplines = function()
-+            local sp = make_spline(curve(), "Opacity", nil, { adjust = "corrupt", corruptFirstWrite = true })
++            local sp = make_spline(curve(), "Opacity")
++            -- Writes succeed, but the curve reads back with every handle shifted by the move.
++            local write = sp.SetKeyFrames
++            function sp:SetKeyFrames(kf)
++                write(self, kf)
++                if not self._drifted then
++                    self._drifted = true
++                    for t, k in pairs(self._kf) do
++                        if t > 12 then -- the outro keyframes, wherever they landed
++                            if k.LH then k.LH[1] = k.LH[1] + 14 end
++                            if k.RH then k.RH[1] = k.RH[1] + 14 end
++                        end
++                    end
++                end
++            end
 +            created[#created + 1] = sp
 +            return { sp }
 +        end
 +        local r = send(captions(1.5))
-+        check(r.ok == true, "keyframes/both: the send still succeeds", tostring(r.error))
-+        check(same_curve(created[1], make_spline(curve(), "x")), "keyframes/both: the curve is left as authored")
++        check(r.ok == true, "keyframes/drift: the send still succeeds", tostring(r.error))
++        check(same_curve(created[1], make_spline(curve(), "x")), "keyframes/drift: caught and restored as authored")
 +    end
 +
-+    -- A curve that already loops is not blamed on the fit.
++    -- A curve that already crosses is not blamed on the fit.
 +    do
 +        print("\n=== keyframes: a curve that already crosses ===")
-+        title_pool()
-+        mp.titleSplines = function()
++        title_pool(nil, function()
 +            local crossed = curve()
-+            crossed[100].LH = { 140, 1 } -- already wrong in the title itself
-+            local sp = make_spline(crossed, "Opacity")
-+            created[#created + 1] = sp
-+            return { sp }
-+        end
++            crossed[100].LH = { 40, 1 } -- already pointing the wrong way in the title itself
++            return crossed
++        end)
 +        send(captions(1.5))
 +        check(same(times_of(created[1]), { 0, 10, 16, 35 }), "keyframes/preexisting: still fitted", show(times_of(created[1])))
 +    end
 +
-+    -- The details come back with the result, because Resolve's free edition does
-+    -- not let the user read a script's output.
++    -- The details come back with the result, because Resolve's free edition does not let the
++    -- user read a script's output.
 +    do
 +        print("\n=== keyframes: the report ===")
 +        title_pool()
 +        local r = send(captions(1.5))
 +        local report = r.keyframeReport or ""
-+        check(report:find("Keyframe fitting v2", 1, true) ~= nil, "keyframes/report: says which version ran")
++        check(report:find("Keyframe fitting v3", 1, true) ~= nil, "keyframes/report: says which version ran", report)
 +        check(report:find("Title length: 120 frames (reported by Resolve)", 1, true) ~= nil,
 +            "keyframes/report: says how long the title is", report)
 +        check(report:find("Caption: 36 frames at 24 fps", 1, true) ~= nil, "keyframes/report: and the caption")
-+        check(report:find("Fitted 'Opacity1'", 1, true) ~= nil and report:find("0.00=0 | 10.00=1", 1, true) ~= nil,
-+            "keyframes/report: shows the keyframes before", report)
-+        check(report:find("16.00=1", 1, true) ~= nil and report:find("35.00=0", 1, true) ~= nil,
++        check(report:find("Fitted 'Opacity1'", 1, true) ~= nil and report:find("0.00=0 RH(0.20,1.4)", 1, true) ~= nil,
++            "keyframes/report: shows the keyframes and handles before", report)
++        check(report:find("16.00=1 LH(-26.00,0)", 1, true) ~= nil and report:find("35.00=0 LH(-0.20,1.39)", 1, true) ~= nil,
 +            "keyframes/report: and after")
 +        check(report:find("across 3 clips", 1, true) ~= nil, "keyframes/report: summarises the whole send")
-+    end
-+    do
-+        print("\n=== keyframes: the report when a curve is restored ===")
-+        title_pool()
-+        mp.titleSplines = function()
-+            local sp = make_spline(curve(), "Opacity", nil, { adjust = false, corruptFirstWrite = true })
-+            created[#created + 1] = sp
-+            return { sp }
-+        end
-+        local r = send(captions(1.5))
-+        local report = r.keyframeReport or ""
-+        check(report:find("did not come out right, so it was restored", 1, true) ~= nil,
-+            "keyframes/report: says a curve was restored", report)
-+        check(report:find("Before:", 1, true) ~= nil and report:find("After:", 1, true) ~= nil,
-+            "keyframes/report: with what Resolve did to it")
 +    end
 +    do
 +        print("\n=== keyframes: no report when nothing was fitted ===")
@@ -4193,19 +4112,6 @@ index d7006f8..c00883f 100644
 +        title_pool()
 +        local off = send(captions(1.5), { fitTitleKeyframes = false })
 +        check(off.ok == true and off.keyframeReport == nil, "keyframes/report: nothing to say when switched off")
-+    end
-+    do
-+        print("\n=== keyframes: the report from a sync ===")
-+        title_pool()
-+        send(captions(1.5))
-+        created = {}
-+        local longer = captions(1.5)
-+        longer[2]["end"] = longer[2].start + 2.5
-+        local r = sync(longer)
-+        check(r.ok == true and type(r.keyframeReport) == "string" and r.keyframeReport:find("Fitted", 1, true) ~= nil,
-+            "keyframes/report: a sync reports too", tostring(r.keyframeReport))
-+        local quiet = sync(longer)
-+        check(quiet.ok == true and quiet.keyframeReport == nil, "keyframes/report: and says nothing when nothing was placed")
 +    end
 +
 +    -- Syncing: a caption whose length changed is placed again and fitted to its new length.
@@ -4221,6 +4127,10 @@ index d7006f8..c00883f 100644
 +            tostring(r.error) .. " replaced=" .. tostring(r.replaced) .. " unchanged=" .. tostring(r.unchanged))
 +        check(#created == 1 and same(times_of(created[1]), { 0, 10, 40, 59 }),
 +            "keyframes/sync: and its animation is fitted to the new length", created[1] and show(times_of(created[1])))
++        check(type(r.keyframeReport) == "string" and r.keyframeReport:find("Fitted", 1, true) ~= nil,
++            "keyframes/sync: a sync reports too", tostring(r.keyframeReport))
++        local quiet = sync(longer)
++        check(quiet.ok == true and quiet.keyframeReport == nil, "keyframes/sync: and says nothing when nothing was placed")
 +    end
 +
 +    -- Syncing: turning the setting off replaces the fitted clips so they match.
