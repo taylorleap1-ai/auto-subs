@@ -129,7 +129,7 @@ index 7bf2e52..e44ff9d 100644
 +const unlabeledCue = [{ ...cue('no speaker here'), speaker_id: undefined }];
 +assert.equal(preserveSubtitleEdits(unlabeledCue, [{ ...unlabeledCue[0], speaker_id: '' }]).changed, false);
 diff --git a/AutoSubs-App/src-tauri/resources/modules/autosubs_core.lua b/AutoSubs-App/src-tauri/resources/modules/autosubs_core.lua
-index 94070f5..82b50e4 100644
+index 94070f5..677e5c0 100644
 --- a/AutoSubs-App/src-tauri/resources/modules/autosubs_core.lua
 +++ b/AutoSubs-App/src-tauri/resources/modules/autosubs_core.lua
 @@ -1403,6 +1403,73 @@ local function get_template(rootFolder, templateName, timeline)
@@ -259,7 +259,7 @@ index 94070f5..82b50e4 100644
  local function get_speaker_from_id(speakers, id, speakerIndexById)
      local normalizedId = normalize_speaker_id(id)
      if normalizedId == nil then return nil end
-@@ -1533,10 +1646,433 @@ local function get_speaker_from_id(speakers, id, speakerIndexById)
+@@ -1533,10 +1646,463 @@ local function get_speaker_from_id(speakers, id, speakerIndexById)
      return speakers[numericId + 1] or speakers[numericId]
  end
  
@@ -338,6 +338,29 @@ index 94070f5..82b50e4 100644
 +    local ok, value = pcall(function() return tool:GetData(key) end)
 +    if ok and value ~= nil and value ~= "" then return tostring(value) end
 +    return nil
++end
++
++-- What the title-animation fitting did, in words. Resolve's free edition does
++-- not show a script's output anywhere the user can read it, so the lines are
++-- also collected, returned with the result, and shown by the app.
++local KEYFRAME_FIT_VERSION = "Keyframe fitting v2 (Fusion AdjustKeyFrames, every result checked)"
++
++local function new_fit_log()
++    return { remaining = 2, contextRemaining = 2, lines = {}, chars = 0 }
++end
++
++local function report_line(log, text)
++    print("[AutoSubs] " .. text)
++    if log and log.lines and #log.lines < 40 and log.chars < 9000 then
++        log.lines[#log.lines + 1] = text
++        log.chars = log.chars + #text
++    end
++end
++
++local function report_text(fitInfo)
++    local log = fitInfo and fitInfo.log
++    if not log or #log.lines == 0 then return nil end
++    return KEYFRAME_FIT_VERSION .. "\n" .. table.concat(log.lines, "\n")
 +end
 +
 +-- Fitting a Text+ title's animation to the clip it is placed on ----------------
@@ -568,7 +591,7 @@ index 94070f5..82b50e4 100644
 +    local function show(label)
 +        if log and log.remaining > 0 then
 +            log.remaining = log.remaining - 1
-+            print(string.format("[AutoSubs] %s", label))
++            report_line(log, label)
 +        end
 +    end
 +    local function read_now()
@@ -610,8 +633,8 @@ index 94070f5..82b50e4 100644
 +            return #times
 +        end
 +        problems[#problems + 1] = "rewriting the curve: " .. tostring(why)
-+        print(string.format("[AutoSubs] Curve '%s' did not come out right, restoring it.  Before: %s   After: %s", name,
-+            describe_keyframes(original), now and describe_keyframes(now) or "(unreadable)"))
++        report_line(log, string.format("Curve '%s' did not come out right, so it was restored.  Before: %s   After: %s",
++            name, describe_keyframes(original), now and describe_keyframes(now) or "(unreadable)"))
 +        pcall(function() return spline:SetKeyFrames(original, true) end)
 +    else
 +        problems[#problems + 1] = "rewriting the curve failed: " .. tostring(rewriteErr)
@@ -657,6 +680,13 @@ index 94070f5..82b50e4 100644
 +        return result
 +    end
 +
++    if log and log.contextRemaining and log.contextRemaining > 0 then
++        log.contextRemaining = log.contextRemaining - 1
++        report_line(log, string.format("Title length: %d frames (%s). Caption: %d frames at %.4g fps. Animation curves found: %d.",
++            templateFrames, templateSeconds and "reported by Resolve" or "guessed from its last keyframe",
++            clipFrames, rate, #splines))
++    end
++
 +    for position, spline in ipairs(splines) do
 +        local splineName = "curve " .. position
 +        pcall(function()
@@ -677,7 +707,7 @@ index 94070f5..82b50e4 100644
 +-- What apply_subtitle_text needs to fit titles: aligned with the clips it is
 +-- given, `which` picking a subset of clipList by index.
 +local function build_fit_info(enabled, frame_rate, clipList, clipTimelineEnd, clipTemplateSeconds, which)
-+    local info = { enabled = enabled, frameRate = frame_rate, clipSeconds = {}, templateSeconds = {} }
++    local info = { enabled = enabled, frameRate = frame_rate, clipSeconds = {}, templateSeconds = {}, log = new_fit_log() }
 +    local function add(position, k)
 +        local clip = clipList[k]
 +        if clip and clipTimelineEnd[k] then
@@ -694,7 +724,7 @@ index 94070f5..82b50e4 100644
  end
  
  local function find_subtitle_clips(timeline, transcriptId, subtitles, targetSpeakerId)
-@@ -1641,16 +2177,31 @@ end
+@@ -1641,16 +2207,31 @@ end
  --   skippedBounds      -- count of segments dropped for falling outside the
  --                         timeline (whisper can emit slightly negative starts,
  --                         and transcripts can be longer than the timeline).
@@ -727,7 +757,7 @@ index 94070f5..82b50e4 100644
      for i, subtitle in ipairs(subtitles) do
          -- Skip malformed segments (nil start/end) instead of crashing in to_frames().
          if subtitle["start"] == nil or subtitle["end"] == nil then
-@@ -1677,6 +2228,13 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
+@@ -1677,6 +2258,13 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
          local timeline_pos = timelineStart + start_frame
          local clip_timeline_duration = end_frame - start_frame
  
@@ -741,7 +771,7 @@ index 94070f5..82b50e4 100644
          -- Clips cannot start before the timeline's first frame.
          if timelineEnd and timeline_pos >= timelineEnd or timeline_pos + clip_timeline_duration <= timelineStart then
              skippedBounds = skippedBounds + 1
-@@ -1698,15 +2256,16 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
+@@ -1698,15 +2286,16 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
              local frames_between = timeline_pos - prevClipEnd
              if frames_between < joinThreshold then
                  prevClip.endFrame = math.max(1, math.floor(
@@ -761,7 +791,7 @@ index 94070f5..82b50e4 100644
              mediaType = 1,
              startFrame = 0,
              endFrame = duration,
-@@ -1716,7 +2275,14 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
+@@ -1716,7 +2305,14 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
  
          table.insert(clipList, newClip)
          table.insert(clipSubtitleIndex, i)
@@ -777,7 +807,7 @@ index 94070f5..82b50e4 100644
          ::continue::
      end
  
-@@ -1725,7 +2291,7 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
+@@ -1725,7 +2321,7 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
              skippedBounds))
      end
  
@@ -786,7 +816,7 @@ index 94070f5..82b50e4 100644
  end
  
  -- Applies subtitle text + styling to each appended timeline item. Instead of
-@@ -1736,8 +2302,10 @@ end
+@@ -1736,8 +2332,10 @@ end
  -- caption_style.apply needs it to tell the bundled macro from a user's own
  -- title before running any helper the comp carries.
  local function apply_subtitle_text(timelineItems, clipCount, subtitles, clipSubtitleIndex, speakers,
@@ -798,7 +828,7 @@ index 94070f5..82b50e4 100644
      local failed = 0
      local noFusionComp = 0
      local firstError = nil
-@@ -1771,18 +2339,50 @@ local function apply_subtitle_text(timelineItems, clipCount, subtitles, clipSubt
+@@ -1771,18 +2369,50 @@ local function apply_subtitle_text(timelineItems, clipCount, subtitles, clipSubt
                          speaker = get_speaker_from_id(speakers, subtitle.speaker_id, speakerIndexById)
                      end
  
@@ -833,7 +863,7 @@ index 94070f5..82b50e4 100644
 +                    -- own length: fit it to this caption. The animated macro
 +                    -- builds its keyframes from the words, so it is left alone.
 +                    if fitInfo and fitInfo.enabled and not caption_style.is_autosubs_template(clipTemplateName) then
-+                        fitInfo.log = fitInfo.log or { remaining = 2 }
++                        fitInfo.log = fitInfo.log or new_fit_log()
 +                        local fitOk, fit = pcall(fit_title_keyframes, comp, fitInfo.templateSeconds[i],
 +                            fitInfo.clipSeconds[i], fitInfo.frameRate, fitInfo.log)
 +                        if fitOk and fit then
@@ -844,25 +874,27 @@ index 94070f5..82b50e4 100644
 +                            elseif fit.noCurves then
 +                                fitted.noCurves = fitted.noCurves + 1
 +                            elseif fit.reason then
-+                                print(string.format("[AutoSubs] Title animation left as is on clip %d: %s", i, fit.reason))
++                                report_line(fitInfo.log, string.format("Title animation left as it was on caption %d: %s", i, fit.reason))
 +                            end
 +                        elseif not fitOk then
-+                            print("[AutoSubs] Title animation left as is: " .. tostring(fit))
++                            report_line(fitInfo.log, "Title animation left as it was: " .. tostring(fit))
 +                        end
 +                    end
  
                      timelineItem:SetClipColor("Green") -- Visualise updated clips
                  end
-@@ -1805,10 +2405,20 @@ local function apply_subtitle_text(timelineItems, clipCount, subtitles, clipSubt
+@@ -1805,10 +2435,22 @@ local function apply_subtitle_text(timelineItems, clipCount, subtitles, clipSubt
              failed, clipCount, tostring(firstError)))
      end
  
 +    if fitted.noCurves > 0 then
-+        print(string.format("[AutoSubs] %d title clip(s) had no keyframe curves (BezierSplines) to fit, so their animation was left as is.",
++        report_line(fitInfo and fitInfo.log, string.format(
++            "%d title clip(s) had no keyframe curves of the kind this can move (BezierSplines), so their animation was left as it was.",
 +            fitted.noCurves))
 +    end
 +    if fitted.keyframes > 0 then
-+        print(string.format("[AutoSubs] Fitted title animation to caption length: %d keyframes on %d curves across %d clips.",
++        report_line(fitInfo and fitInfo.log, string.format(
++            "Fitted title animation to caption length: %d keyframes on %d curves across %d clips.",
 +            fitted.keyframes, fitted.curves, fitted.clips))
 +    end
 +
@@ -875,7 +907,7 @@ index 94070f5..82b50e4 100644
  end
  
  -- Add subtitles to the timeline using the specified template
-@@ -1818,6 +2428,11 @@ end
+@@ -1818,6 +2460,11 @@ end
  function AddSubtitles(req)
      local filePath, trackIndex, templateName = req.filePath, req.trackIndex, req.templateName
      local conflictMode, presetSettings = req.conflictMode, req.presetSettings
@@ -887,7 +919,7 @@ index 94070f5..82b50e4 100644
      refresh_project()
      resolve:OpenPage("edit")
  
-@@ -1845,7 +2460,7 @@ function AddSubtitles(req)
+@@ -1845,7 +2492,7 @@ function AddSubtitles(req)
              if not subtitles or #subtitles == 0 then
                  return make_error("Failed to add subtitles", "Transcript has no segments")
              end
@@ -896,7 +928,7 @@ index 94070f5..82b50e4 100644
              local transcriptId = get_transcript_id(data, filePath)
  
              local speakersExist = false
-@@ -1877,9 +2492,15 @@ function AddSubtitles(req)
+@@ -1877,9 +2524,15 @@ function AddSubtitles(req)
                  return make_error("Template not found", templateErr)
              end
  
@@ -915,7 +947,7 @@ index 94070f5..82b50e4 100644
  
              if #clipList == 0 then
                  local reason = skippedBounds > 0 and
-@@ -2059,9 +2680,15 @@ function AddSubtitles(req)
+@@ -2059,9 +2712,15 @@ function AddSubtitles(req)
              if isAnimated and font_fallback then
                  presetSettings, fontSwap = font_fallback.maybe_override(presetSettings, data["language"])
              end
@@ -932,7 +964,26 @@ index 94070f5..82b50e4 100644
              if skippedBounds > 0 then
                  applyStats.failed = applyStats.failed + skippedBounds
                  applyStats.total = applyStats.total + skippedBounds
-@@ -2113,6 +2740,7 @@ end
+@@ -2086,7 +2745,8 @@ function AddSubtitles(req)
+                     total = applyStats.total,
+                     noFusionComp = applyStats.noFusionComp,
+                     skipped = skippedBounds,
+-                    detail = applyStats.firstError
++                    detail = applyStats.firstError,
++                    keyframeReport = report_text(fitInfo)
+                 }
+             elseif applyStats and applyStats.failed == applyStats.total and applyStats.total > 0 then
+                 local short = string.format("Failed to place all %d subtitles", applyStats.total)
+@@ -2099,7 +2759,7 @@ function AddSubtitles(req)
+                 return make_error(short, applyStats.firstError, errCode)
+             end
+ 
+-            return { ok = true, fontSwap = fontSwap }
++            return { ok = true, fontSwap = fontSwap, keyframeReport = report_text(fitInfo) }
+         end)() -- end of inner placement function
+     end)
+ 
+@@ -2113,6 +2773,7 @@ end
  
  function BatchApplyStyle(req)
      local filePath, targetSpeakerId, presetSettings = req.filePath, req.targetSpeakerId, req.presetSettings
@@ -940,7 +991,7 @@ index 94070f5..82b50e4 100644
      refresh_project()
  
      local data, loadErr = load_subtitle_data(req)
-@@ -2131,7 +2759,7 @@ function BatchApplyStyle(req)
+@@ -2131,7 +2792,7 @@ function BatchApplyStyle(req)
      end
  
      local speakers = data["speakers"] or {}
@@ -949,7 +1000,7 @@ index 94070f5..82b50e4 100644
      local transcriptId = get_transcript_id(data, filePath)
      local matches, discovery = find_subtitle_clips(
          timeline,
-@@ -2144,6 +2772,7 @@ function BatchApplyStyle(req)
+@@ -2144,6 +2805,7 @@ function BatchApplyStyle(req)
      if presetSettings ~= nil and next(presetSettings) ~= nil and font_fallback then
          presetSettings, fontSwap = font_fallback.maybe_override(presetSettings, data["language"])
      end
@@ -957,7 +1008,7 @@ index 94070f5..82b50e4 100644
  
      local updated = 0
      local skipped = 0
-@@ -2154,10 +2783,14 @@ function BatchApplyStyle(req)
+@@ -2154,10 +2816,14 @@ function BatchApplyStyle(req)
          local ok, err = pcall(function()
              local didUpdate = false
  
@@ -973,7 +1024,7 @@ index 94070f5..82b50e4 100644
                  if next(clipSettings) ~= nil then
                      caption_style.write(match.comp, match.styleTool, clipSettings)
                      didUpdate = true
-@@ -2203,6 +2836,413 @@ function BatchApplyStyle(req)
+@@ -2203,6 +2869,416 @@ function BatchApplyStyle(req)
      }
  end
  
@@ -1290,6 +1341,7 @@ index 94070f5..82b50e4 100644
 +                end
 +            end
 +            local placed = {}
++            local syncReport = nil
 +            if #addClips > 0 then
 +                local batchOk, batch = pcall(function() return mediaPool:AppendToTimeline(addClips) end)
 +                if batchOk and type(batch) == "table" then
@@ -1312,6 +1364,7 @@ index 94070f5..82b50e4 100644
 +                    segmentPresets, presetLibrary, addTemplateNames, fitInfo)
 +                failed = failed + applyStats.failed
 +                if firstError == nil then firstError = applyStats.firstError end
++                syncReport = report_text(fitInfo)
 +            end
 +
 +            -- Restyle in place the clips that only differ in how they look, and
@@ -1374,6 +1427,7 @@ index 94070f5..82b50e4 100644
 +                skipped = skippedBounds,
 +                detail = firstError,
 +                fontSwap = fontSwap,
++                keyframeReport = syncReport,
 +            }
 +        end)()
 +    end)
@@ -1387,7 +1441,7 @@ index 94070f5..82b50e4 100644
  -- Which video track holds this item. Resolve hands back a fresh proxy on each
  -- call, so fall back to the unique id when identity comparison comes up empty.
  local function track_index_of_item(timeline, target)
-@@ -2805,6 +3845,10 @@ local handlers = {
+@@ -2805,6 +3881,10 @@ local handlers = {
          return { message = "Job completed", result = AddSubtitles(req) }
      end,
  
@@ -1399,7 +1453,7 @@ index 94070f5..82b50e4 100644
  
      ReloadServer = function()
 diff --git a/AutoSubs-App/src/api/resolve-api.ts b/AutoSubs-App/src/api/resolve-api.ts
-index d1b7375..a997b86 100644
+index d1b7375..303d8c8 100644
 --- a/AutoSubs-App/src/api/resolve-api.ts
 +++ b/AutoSubs-App/src/api/resolve-api.ts
 @@ -1,6 +1,8 @@
@@ -1411,7 +1465,16 @@ index d1b7375..a997b86 100644
  
  /**
   * Error thrown when the AutoSubs Lua server (inside Resolve) reports a failure
-@@ -223,6 +225,7 @@ export async function addSubtitlesToTimeline(
+@@ -183,6 +185,8 @@ export interface AddSubtitlesResult {
+     /** Segments skipped for falling outside the timeline's range. */
+     skipped?: number;
+     detail?: string;
++    /** What fitting a Text+ title's animation to each caption did, in words. */
++    keyframeReport?: string;
+   } | false;
+ }
+ 
+@@ -223,6 +227,7 @@ export async function addSubtitlesToTimeline(
    outputTrack: string,
    conflictMode: ConflictMode = null,
    presetSettings?: Record<string, unknown>,
@@ -1419,7 +1482,7 @@ index d1b7375..a997b86 100644
  ): Promise<AddSubtitlesResult> {
    const filePath = await getSubtitleDocumentPath(filename);
    const data = await callResolve({
-@@ -232,6 +235,13 @@ export async function addSubtitlesToTimeline(
+@@ -232,6 +237,13 @@ export async function addSubtitlesToTimeline(
      trackIndex: outputTrack,
      conflictMode,
      presetSettings,
@@ -1433,7 +1496,7 @@ index d1b7375..a997b86 100644
    });
    // Top-level failure (e.g. the server-side handler's pcall caught an error).
    throwIfError(data, 'AddSubtitles');
-@@ -242,10 +252,64 @@ export async function addSubtitlesToTimeline(
+@@ -242,10 +254,66 @@ export async function addSubtitlesToTimeline(
    return data;
  }
  
@@ -1456,6 +1519,8 @@ index d1b7375..a997b86 100644
 +    skipped?: number;
 +    detail?: string;
 +    fontSwap?: FontSwapInfo | null;
++    /** What fitting a Text+ title's animation to each caption did, in words. */
++    keyframeReport?: string;
 +  } | false;
 +}
 +
@@ -1498,7 +1563,7 @@ index d1b7375..a997b86 100644
  ): Promise<BatchApplyStyleResult> {
    const filePath = await getSubtitleDocumentPath(filename);
    const data = await callResolve({
-@@ -253,6 +317,8 @@ export async function applyStylesToTimeline(
+@@ -253,6 +321,8 @@ export async function applyStylesToTimeline(
      filePath,
      targetSpeakerId,
      presetSettings,
@@ -1555,7 +1620,7 @@ index d806e82..24e8461 100644
      );
  }
 diff --git a/AutoSubs-App/src/components/captions/output-panel.tsx b/AutoSubs-App/src/components/captions/output-panel.tsx
-index 334ac22..c7680df 100644
+index 334ac22..a58861e 100644
 --- a/AutoSubs-App/src/components/captions/output-panel.tsx
 +++ b/AutoSubs-App/src/components/captions/output-panel.tsx
 @@ -5,6 +5,7 @@ import {
@@ -1575,15 +1640,16 @@ index 334ac22..c7680df 100644
    type ConflictInfo,
  } from "@/api/resolve-api";
  import { useIntegration } from "@/contexts/IntegrationContext";
-@@ -36,6 +39,7 @@ import {
+@@ -36,6 +39,8 @@ import {
    resolveCaptionStyle,
  } from "@/lib/caption-style";
  import type { CaptionPreset, Speaker, TimelineInfo } from "@/types";
 +import { buildLineStyles } from "@/lib/line-styles";
++import { showKeyframeReport } from "@/lib/keyframe-report";
  import { cn } from "@/lib/utils";
  
  interface OutputPanelProps {
-@@ -91,8 +95,14 @@ export function OutputPanel({
+@@ -91,8 +96,14 @@ export function OutputPanel({
    // leaving file export available.
    const editorConnected = isConnected && !isStandalone;
  
@@ -1600,7 +1666,7 @@ index 334ac22..c7680df 100644
  
    const { captionStyle, selectedOutputTrack } = useSettingsStore(
      useShallow((s) => ({
-@@ -133,6 +143,7 @@ export function OutputPanel({
+@@ -133,6 +144,7 @@ export function OutputPanel({
    >(null);
    const [conflictInfo, setConflictInfo] = React.useState<ConflictInfo | null>(null);
    const [isApplyingStyles, setIsApplyingStyles] = React.useState(false);
@@ -1608,7 +1674,7 @@ index 334ac22..c7680df 100644
  
    // Tear the sheet down only after its exit animation has run. `expanded`
    // stays true throughout, which is what keeps the transcript from popping in
-@@ -252,6 +263,12 @@ export function OutputPanel({
+@@ -252,6 +264,12 @@ export function OutputPanel({
      if (!currentSubtitleDocumentFilename) return;
  
      const { presetSettings } = resolveCaptionStyle(captionStyle, presets.getPreset);
@@ -1621,7 +1687,7 @@ index 334ac22..c7680df 100644
  
      setIsApplyingStyles(true);
      try {
-@@ -259,6 +276,7 @@ export function OutputPanel({
+@@ -259,6 +277,7 @@ export function OutputPanel({
          currentSubtitleDocumentFilename,
          undefined,
          presetSettings,
@@ -1629,7 +1695,7 @@ index 334ac22..c7680df 100644
        );
  
        if (result.matched === 0) {
-@@ -281,6 +299,73 @@ export function OutputPanel({
+@@ -281,6 +300,75 @@ export function OutputPanel({
      }
    }
  
@@ -1677,6 +1743,8 @@ index 334ac22..c7680df 100644
 +        .filter(([, count]) => (count ?? 0) > 0)
 +        .map(([kind, count]) => t(`captions.sync.parts.${kind}`, { count }));
 +
++      showKeyframeReport(result?.keyframeReport);
++
 +      if ((result?.failed ?? 0) > 0) {
 +        toast.warning(t("captions.sync.partial", { failed: result?.failed }), {
 +          description: result?.detail,
@@ -1703,7 +1771,7 @@ index 334ac22..c7680df 100644
    function handleSpeakerChange(index: number, updated: Speaker) {
      const next = [...speakers];
      next[index] = updated;
-@@ -288,7 +373,7 @@ export function OutputPanel({
+@@ -288,7 +376,7 @@ export function OutputPanel({
    }
  
    // ── Primary action label ────────────────────────────────────────────────
@@ -1712,7 +1780,7 @@ index 334ac22..c7680df 100644
  
    let actionLabel: React.ReactNode;
    if (isAdding) {
-@@ -394,13 +479,36 @@ export function OutputPanel({
+@@ -394,13 +482,36 @@ export function OutputPanel({
            )}
  
            <div className="flex flex-wrap justify-end gap-2 p-3">
@@ -2096,10 +2164,10 @@ index 489e28e..a26c361 100644
        setJustSent(true);
      } catch (error) {
 diff --git a/AutoSubs-App/src/contexts/ResolveContext.tsx b/AutoSubs-App/src/contexts/ResolveContext.tsx
-index b023f6c..8277e38 100644
+index b023f6c..384d5ce 100644
 --- a/AutoSubs-App/src/contexts/ResolveContext.tsx
 +++ b/AutoSubs-App/src/contexts/ResolveContext.tsx
-@@ -1,6 +1,7 @@
+@@ -1,10 +1,12 @@
  import React, { createContext, useContext, useState, useRef, useEffect, useCallback } from 'react';
  import { toast } from 'sonner';
  import { Template, TimelineInfo } from '@/types';
@@ -2107,7 +2175,12 @@ index b023f6c..8277e38 100644
  import { getTimelineInfo, getTemplates, cancelExport, addSubtitlesToTimeline, ResolveApiError } from '@/api/resolve-api';
  import i18n from '@/i18n';
  import { useIntegration } from '@/contexts/IntegrationContext';
-@@ -19,7 +20,7 @@ interface ResolveContextType {
+ import { useSettingsStore } from '@/stores/settings-store';
++import { showKeyframeReport } from '@/lib/keyframe-report';
+ import { validateExportedAudioFile } from '@/utils/file-utils';
+ 
+ interface ResolveContextType {
+@@ -19,7 +21,7 @@ interface ResolveContextType {
    refresh: () => Promise<void>;
    /** Loads the project's Fusion title templates; `force` bypasses the cache. */
    refreshTemplates: (options?: { force?: boolean }) => Promise<Template[]>;
@@ -2116,7 +2189,7 @@ index b023f6c..8277e38 100644
    getSourceAudio: (audioInputMode: "file" | "timeline", fileInput: string | null, inputTracks: string[]) => Promise<{ path: string, offset: number } | null>;
    setIsExporting: (isExporting: boolean) => void;
    setExportProgress: (progress: number) => void;
-@@ -210,13 +211,14 @@ export function ResolveProvider({ children }: { children: React.ReactNode }) {
+@@ -210,19 +212,22 @@ export function ResolveProvider({ children }: { children: React.ReactNode }) {
      selectedTemplate?: string,
      selectedOutputTrack?: string,
      presetSettings?: Record<string, unknown>,
@@ -2132,6 +2205,14 @@ index b023f6c..8277e38 100644
  
      // Surface a language-aware font swap (done server-side in the Lua macro
      // server) so the user knows why their caption font changed.
+     const rawResult = response && typeof response === 'object' ? response.result : undefined;
+     const result = rawResult && typeof rawResult === 'object' ? rawResult : undefined;
+     const fontSwap = result?.fontSwap;
++    // What fitting a title's animation did, with a button to copy it.
++    showKeyframeReport(result?.keyframeReport);
+     // Placement stats come back as structured fields so the toast can be
+     // localized; `detail` stays a raw technical message.
+     const failed = result?.failed ?? 0;
 diff --git a/AutoSubs-App/src/contexts/SubtitleDocumentContext.tsx b/AutoSubs-App/src/contexts/SubtitleDocumentContext.tsx
 index b810376..b32bdbb 100644
 --- a/AutoSubs-App/src/contexts/SubtitleDocumentContext.tsx
@@ -2303,7 +2384,7 @@ index b810376..b32bdbb 100644
        flushPendingSubtitleSave,
        processTranscriptionResults,
 diff --git a/AutoSubs-App/src/i18n/locales/de/translation.json b/AutoSubs-App/src/i18n/locales/de/translation.json
-index 179e8a2..5b7c042 100644
+index 179e8a2..64c13ba 100644
 --- a/AutoSubs-App/src/i18n/locales/de/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/de/translation.json
 @@ -487,6 +487,12 @@
@@ -2319,7 +2400,7 @@ index 179e8a2..5b7c042 100644
      "previousSubtitles": "Untertitelverlauf",
      "empty": {
        "noSubtitlesAvailable": "Deine Untertitel werden hier angezeigt, sobald die Transkription abgeschlossen ist"
-@@ -637,6 +643,26 @@
+@@ -637,6 +643,33 @@
        "partial": "{{updated}} aktualisiert, {{failed}} fehlgeschlagen",
        "failed": "Timeline-Stile konnten nicht geändert werden"
      },
@@ -2343,11 +2424,18 @@ index 179e8a2..5b7c042 100644
 +      "label": "Titel-Animation an die Untertitellänge anpassen",
 +      "description": "Verschiebt die Keyframes deiner Text+-Titel, damit das Intro am Anfang jedes Untertitels und das Outro an seinem Ende abläuft."
 +    },
++    "keyframeReport": {
++      "title": "Details zur Titel-Animation",
++      "description": "Wenn die Animation falsch aussieht, kopiere dies und sende es an die Person, die dir hilft.",
++      "copy": "Details kopieren",
++      "copied": "In die Zwischenablage kopiert",
++      "copyFailed": "Kopieren fehlgeschlagen. Mach stattdessen einen Screenshot."
++    },
      "send": {
        "adding": "Wird gesendet...",
        "placedPartial": "{{placed}} von {{total}} Untertiteln platziert",
 diff --git a/AutoSubs-App/src/i18n/locales/en/translation.json b/AutoSubs-App/src/i18n/locales/en/translation.json
-index f59edad..198fa90 100644
+index f59edad..06d5778 100644
 --- a/AutoSubs-App/src/i18n/locales/en/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/en/translation.json
 @@ -507,6 +507,12 @@
@@ -2363,7 +2451,7 @@ index f59edad..198fa90 100644
      "previousSubtitles": "Subtitle History",
      "empty": {
        "noSubtitlesAvailable": "Your subtitles will appear here when finished transcribing"
-@@ -657,6 +663,26 @@
+@@ -657,6 +663,33 @@
        "partial": "Updated {{updated}} clips, {{failed}} failed",
        "failed": "Couldn't update timeline styles"
      },
@@ -2387,11 +2475,18 @@ index f59edad..198fa90 100644
 +      "label": "Fit title animation to caption length",
 +      "description": "Moves the keyframes of your Text+ titles so the intro plays at the start of each caption and the outro at its end."
 +    },
++    "keyframeReport": {
++      "title": "Title animation details",
++      "description": "If the animation looks wrong, copy this and send it to whoever is helping you.",
++      "copy": "Copy details",
++      "copied": "Copied to clipboard",
++      "copyFailed": "Couldn't copy. Take a screenshot instead."
++    },
      "send": {
        "adding": "Sending...",
        "placedPartial": "Placed {{placed}} of {{total}} subtitles",
 diff --git a/AutoSubs-App/src/i18n/locales/es/translation.json b/AutoSubs-App/src/i18n/locales/es/translation.json
-index 8db6c5d..919daac 100644
+index 8db6c5d..f417170 100644
 --- a/AutoSubs-App/src/i18n/locales/es/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/es/translation.json
 @@ -487,6 +487,12 @@
@@ -2407,7 +2502,7 @@ index 8db6c5d..919daac 100644
      "previousSubtitles": "Historial de subtítulos",
      "empty": {
        "noSubtitlesAvailable": "Tus subtítulos aparecerán aquí cuando termine la transcripción"
-@@ -637,6 +643,26 @@
+@@ -637,6 +643,33 @@
        "partial": "{{updated}} actualizados, {{failed}} con error",
        "failed": "No se pudieron actualizar los estilos"
      },
@@ -2431,11 +2526,18 @@ index 8db6c5d..919daac 100644
 +      "label": "Ajustar la animación del título a la duración del subtítulo",
 +      "description": "Mueve los fotogramas clave de tus títulos Text+ para que la entrada ocurra al inicio de cada subtítulo y la salida al final."
 +    },
++    "keyframeReport": {
++      "title": "Detalles de la animación del título",
++      "description": "Si la animación se ve mal, copia esto y envíalo a quien te esté ayudando.",
++      "copy": "Copiar detalles",
++      "copied": "Copiado al portapapeles",
++      "copyFailed": "No se pudo copiar. Haz una captura de pantalla."
++    },
      "send": {
        "adding": "Enviando...",
        "placedPartial": "Colocados {{placed}} de {{total}} subtítulos",
 diff --git a/AutoSubs-App/src/i18n/locales/fr/translation.json b/AutoSubs-App/src/i18n/locales/fr/translation.json
-index eaf79f0..1c83ecd 100644
+index eaf79f0..625548f 100644
 --- a/AutoSubs-App/src/i18n/locales/fr/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/fr/translation.json
 @@ -487,6 +487,12 @@
@@ -2451,7 +2553,7 @@ index eaf79f0..1c83ecd 100644
      "previousSubtitles": "Historique des sous-titres",
      "empty": {
        "noSubtitlesAvailable": "Vos sous-titres apparaîtront ici une fois la transcription terminée"
-@@ -637,6 +643,26 @@
+@@ -637,6 +643,33 @@
        "partial": "{{updated}} actualisés, {{failed}} en échec",
        "failed": "Impossible d’actualiser les styles"
      },
@@ -2475,11 +2577,18 @@ index eaf79f0..1c83ecd 100644
 +      "label": "Adapter l'animation du titre à la durée du sous-titre",
 +      "description": "Déplace les images clés de vos titres Text+ pour que l'intro se joue au début de chaque sous-titre et l'outro à sa fin."
 +    },
++    "keyframeReport": {
++      "title": "Détails de l'animation du titre",
++      "description": "Si l'animation semble incorrecte, copiez ceci et envoyez-le à la personne qui vous aide.",
++      "copy": "Copier les détails",
++      "copied": "Copié dans le presse-papiers",
++      "copyFailed": "Copie impossible. Faites plutôt une capture d'écran."
++    },
      "send": {
        "adding": "Envoi en cours...",
        "placedPartial": "{{placed}} sous-titres placés sur {{total}}",
 diff --git a/AutoSubs-App/src/i18n/locales/ja/translation.json b/AutoSubs-App/src/i18n/locales/ja/translation.json
-index 1bfdb8d..45c757e 100644
+index 1bfdb8d..0642ece 100644
 --- a/AutoSubs-App/src/i18n/locales/ja/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/ja/translation.json
 @@ -504,6 +504,12 @@
@@ -2495,7 +2604,7 @@ index 1bfdb8d..45c757e 100644
      "previousSubtitles": "字幕履歴",
      "status": {
        "count_one": "字幕 {{count}} 件",
-@@ -637,6 +643,26 @@
+@@ -637,6 +643,33 @@
        "partial": "{{updated}}件更新、{{failed}}件失敗",
        "failed": "タイムラインのスタイルを更新できませんでした"
      },
@@ -2519,11 +2628,18 @@ index 1bfdb8d..45c757e 100644
 +      "label": "タイトルのアニメーションを字幕の長さに合わせる",
 +      "description": "Text+ タイトルのキーフレームを移動し、イントロを各字幕の先頭で、アウトロを末尾で再生します。"
 +    },
++    "keyframeReport": {
++      "title": "タイトルアニメーションの詳細",
++      "description": "アニメーションがおかしい場合は、これをコピーして手伝ってくれている人に送ってください。",
++      "copy": "詳細をコピー",
++      "copied": "クリップボードにコピーしました",
++      "copyFailed": "コピーできませんでした。代わりにスクリーンショットを撮ってください。"
++    },
      "send": {
        "adding": "送信中...",
        "placedPartial": "{{total}}件中{{placed}}件の字幕を配置しました",
 diff --git a/AutoSubs-App/src/i18n/locales/ko/translation.json b/AutoSubs-App/src/i18n/locales/ko/translation.json
-index e3bf390..0e48750 100644
+index e3bf390..fc9fde8 100644
 --- a/AutoSubs-App/src/i18n/locales/ko/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/ko/translation.json
 @@ -503,6 +503,12 @@
@@ -2539,7 +2655,7 @@ index e3bf390..0e48750 100644
      "previousSubtitles": "자막 기록",
      "waitingForSubtitles": "자막을 기다리는 중...",
      "status": {
-@@ -637,6 +643,26 @@
+@@ -637,6 +643,33 @@
        "partial": "{{updated}}개 업데이트, {{failed}}개 실패",
        "failed": "타임라인 스타일을 업데이트하지 못했습니다"
      },
@@ -2563,11 +2679,18 @@ index e3bf390..0e48750 100644
 +      "label": "제목 애니메이션을 자막 길이에 맞추기",
 +      "description": "Text+ 제목의 키프레임을 이동해 인트로는 각 자막의 시작에서, 아웃트로는 끝에서 재생되도록 합니다."
 +    },
++    "keyframeReport": {
++      "title": "제목 애니메이션 상세 정보",
++      "description": "애니메이션이 이상해 보이면 이 내용을 복사해 도와주는 분께 보내 주세요.",
++      "copy": "상세 정보 복사",
++      "copied": "클립보드에 복사되었습니다",
++      "copyFailed": "복사하지 못했습니다. 대신 스크린샷을 찍어 주세요."
++    },
      "send": {
        "adding": "전송 중...",
        "placedPartial": "자막 {{total}}개 중 {{placed}}개 배치",
 diff --git a/AutoSubs-App/src/i18n/locales/ru/translation.json b/AutoSubs-App/src/i18n/locales/ru/translation.json
-index 7eeafc1..bfe3226 100644
+index 7eeafc1..25589f5 100644
 --- a/AutoSubs-App/src/i18n/locales/ru/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/ru/translation.json
 @@ -497,6 +497,12 @@
@@ -2583,7 +2706,7 @@ index 7eeafc1..bfe3226 100644
      "previousSubtitles": "История субтитров",
      "empty": {
        "noSubtitlesAvailable": "Здесь появятся субтитры после завершения транскрибации"
-@@ -647,6 +653,26 @@
+@@ -647,6 +653,33 @@
        "partial": "Обновлено: {{updated}}, ошибок: {{failed}}",
        "failed": "Не удалось обновить стили таймлайна"
      },
@@ -2607,11 +2730,18 @@ index 7eeafc1..bfe3226 100644
 +      "label": "Подгонять анимацию титра под длину субтитра",
 +      "description": "Сдвигает ключевые кадры ваших титров Text+, чтобы вступление проигрывалось в начале каждого субтитра, а завершение — в конце."
 +    },
++    "keyframeReport": {
++      "title": "Сведения об анимации титра",
++      "description": "Если анимация выглядит неправильно, скопируйте это и отправьте тому, кто вам помогает.",
++      "copy": "Копировать сведения",
++      "copied": "Скопировано в буфер обмена",
++      "copyFailed": "Не удалось скопировать. Сделайте скриншот."
++    },
      "send": {
        "adding": "Отправка...",
        "placedPartial": "Размещено {{placed}} из {{total}} субтитров",
 diff --git a/AutoSubs-App/src/i18n/locales/zh/translation.json b/AutoSubs-App/src/i18n/locales/zh/translation.json
-index dbaea54..ecfe991 100644
+index dbaea54..04a6f74 100644
 --- a/AutoSubs-App/src/i18n/locales/zh/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/zh/translation.json
 @@ -487,6 +487,12 @@
@@ -2627,7 +2757,7 @@ index dbaea54..ecfe991 100644
      "previousSubtitles": "字幕历史",
      "empty": {
        "noSubtitlesAvailable": "转录完成后，字幕将显示在这里"
-@@ -637,6 +643,26 @@
+@@ -637,6 +643,33 @@
        "partial": "已更新 {{updated}} 个，失败 {{failed}} 个",
        "failed": "无法更新时间线样式"
      },
@@ -2651,9 +2781,58 @@ index dbaea54..ecfe991 100644
 +      "label": "使标题动画适应字幕时长",
 +      "description": "移动 Text+ 标题的关键帧，使开场动画在每条字幕开头播放，结束动画在末尾播放。"
 +    },
++    "keyframeReport": {
++      "title": "标题动画详情",
++      "description": "如果动画看起来不对，请复制这些内容并发送给协助您的人。",
++      "copy": "复制详情",
++      "copied": "已复制到剪贴板",
++      "copyFailed": "无法复制，请改为截图。"
++    },
      "send": {
        "adding": "正在发送...",
        "placedPartial": "已放置 {{total}} 条字幕中的 {{placed}} 条",
+diff --git a/AutoSubs-App/src/lib/keyframe-report.ts b/AutoSubs-App/src/lib/keyframe-report.ts
+new file mode 100644
+index 0000000..c6662b1
+--- /dev/null
++++ b/AutoSubs-App/src/lib/keyframe-report.ts
+@@ -0,0 +1,36 @@
++import { toast } from "sonner";
++import i18n from "@/i18n";
++
++/**
++ * Show what the title-animation fitting did, with a button to copy it.
++ *
++ * The Resolve script's own output is not visible in the free edition of
++ * Resolve, so the details come back with the result and are shown here. The
++ * notification stays until it is dismissed so it cannot be missed.
++ */
++export function showKeyframeReport(report: string | null | undefined) {
++  if (!report) return;
++
++  toast.info(i18n.t("captions.keyframeReport.title"), {
++    description: i18n.t("captions.keyframeReport.description"),
++    duration: Infinity,
++    closeButton: true,
++    action: {
++      label: i18n.t("captions.keyframeReport.copy"),
++      onClick: async () => {
++        try {
++          await navigator.clipboard.writeText(report);
++          toast.success(i18n.t("captions.keyframeReport.copied"));
++        } catch (err) {
++          console.error("Could not copy the title animation details:", err);
++          // Show the text itself so it can be read or photographed instead.
++          toast.error(i18n.t("captions.keyframeReport.copyFailed"), {
++            description: report,
++            duration: Infinity,
++            closeButton: true,
++          });
++        }
++      },
++    },
++  });
++}
 diff --git a/AutoSubs-App/src/lib/line-styles.ts b/AutoSubs-App/src/lib/line-styles.ts
 new file mode 100644
 index 0000000..3d4e2ce
@@ -2993,7 +3172,7 @@ index 0c2f602..eab30de 100644
  
    for (const subtitle of normalizedSubtitles) {
 diff --git a/AutoSubs-App/tests/mock_resolve_test.lua b/AutoSubs-App/tests/mock_resolve_test.lua
-index d7006f8..278d6ac 100644
+index d7006f8..c00883f 100644
 --- a/AutoSubs-App/tests/mock_resolve_test.lua
 +++ b/AutoSubs-App/tests/mock_resolve_test.lua
 @@ -23,6 +23,7 @@ local function make_tool()
@@ -3148,7 +3327,7 @@ index d7006f8..278d6ac 100644
                  table.insert(track.items, item and { handle = item } or nil)
                  results[i] = item
              end
-@@ -747,5 +864,855 @@ do
+@@ -747,5 +864,912 @@ do
      check_marker_move(2, 50, 38, "marker move with lead-in")
  end
  
@@ -3970,6 +4149,63 @@ index d7006f8..278d6ac 100644
 +        end
 +        send(captions(1.5))
 +        check(same(times_of(created[1]), { 0, 10, 16, 35 }), "keyframes/preexisting: still fitted", show(times_of(created[1])))
++    end
++
++    -- The details come back with the result, because Resolve's free edition does
++    -- not let the user read a script's output.
++    do
++        print("\n=== keyframes: the report ===")
++        title_pool()
++        local r = send(captions(1.5))
++        local report = r.keyframeReport or ""
++        check(report:find("Keyframe fitting v2", 1, true) ~= nil, "keyframes/report: says which version ran")
++        check(report:find("Title length: 120 frames (reported by Resolve)", 1, true) ~= nil,
++            "keyframes/report: says how long the title is", report)
++        check(report:find("Caption: 36 frames at 24 fps", 1, true) ~= nil, "keyframes/report: and the caption")
++        check(report:find("Fitted 'Opacity1'", 1, true) ~= nil and report:find("0.00=0 | 10.00=1", 1, true) ~= nil,
++            "keyframes/report: shows the keyframes before", report)
++        check(report:find("16.00=1", 1, true) ~= nil and report:find("35.00=0", 1, true) ~= nil,
++            "keyframes/report: and after")
++        check(report:find("across 3 clips", 1, true) ~= nil, "keyframes/report: summarises the whole send")
++    end
++    do
++        print("\n=== keyframes: the report when a curve is restored ===")
++        title_pool()
++        mp.titleSplines = function()
++            local sp = make_spline(curve(), "Opacity", nil, { adjust = false, corruptFirstWrite = true })
++            created[#created + 1] = sp
++            return { sp }
++        end
++        local r = send(captions(1.5))
++        local report = r.keyframeReport or ""
++        check(report:find("did not come out right, so it was restored", 1, true) ~= nil,
++            "keyframes/report: says a curve was restored", report)
++        check(report:find("Before:", 1, true) ~= nil and report:find("After:", 1, true) ~= nil,
++            "keyframes/report: with what Resolve did to it")
++    end
++    do
++        print("\n=== keyframes: no report when nothing was fitted ===")
++        title_pool()
++        mp.splinesOnAll = true
++        local r = send(captions(1.5), { templateName = "AutoSubs Caption 2026-09-17" })
++        check(r.ok == true and r.keyframeReport == nil, "keyframes/report: nothing to say for the animated macro",
++            tostring(r.keyframeReport))
++        title_pool()
++        local off = send(captions(1.5), { fitTitleKeyframes = false })
++        check(off.ok == true and off.keyframeReport == nil, "keyframes/report: nothing to say when switched off")
++    end
++    do
++        print("\n=== keyframes: the report from a sync ===")
++        title_pool()
++        send(captions(1.5))
++        created = {}
++        local longer = captions(1.5)
++        longer[2]["end"] = longer[2].start + 2.5
++        local r = sync(longer)
++        check(r.ok == true and type(r.keyframeReport) == "string" and r.keyframeReport:find("Fitted", 1, true) ~= nil,
++            "keyframes/report: a sync reports too", tostring(r.keyframeReport))
++        local quiet = sync(longer)
++        check(quiet.ok == true and quiet.keyframeReport == nil, "keyframes/report: and says nothing when nothing was placed")
 +    end
 +
 +    -- Syncing: a caption whose length changed is placed again and fitted to its new length.
