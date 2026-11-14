@@ -129,7 +129,7 @@ index 7bf2e52..e44ff9d 100644
 +const unlabeledCue = [{ ...cue('no speaker here'), speaker_id: undefined }];
 +assert.equal(preserveSubtitleEdits(unlabeledCue, [{ ...unlabeledCue[0], speaker_id: '' }]).changed, false);
 diff --git a/AutoSubs-App/src-tauri/resources/modules/autosubs_core.lua b/AutoSubs-App/src-tauri/resources/modules/autosubs_core.lua
-index 94070f5..a36f8a1 100644
+index 94070f5..f4983c3 100644
 --- a/AutoSubs-App/src-tauri/resources/modules/autosubs_core.lua
 +++ b/AutoSubs-App/src-tauri/resources/modules/autosubs_core.lua
 @@ -1403,6 +1403,73 @@ local function get_template(rootFolder, templateName, timeline)
@@ -983,7 +983,7 @@ index 94070f5..a36f8a1 100644
                  if next(clipSettings) ~= nil then
                      caption_style.write(match.comp, match.styleTool, clipSettings)
                      didUpdate = true
-@@ -2203,6 +2828,416 @@ function BatchApplyStyle(req)
+@@ -2203,6 +2828,572 @@ function BatchApplyStyle(req)
      }
  end
  
@@ -1397,10 +1397,166 @@ index 94070f5..a36f8a1 100644
 +    return result
 +end
 +
++-- Report how a title on the timeline is built and animated, so its keyframes
++-- can be understood without guessing: every tool in its Fusion composition and
++-- everything that drives an input (a spline, a path, an expression, an OpenFX
++-- parameter), with each spline's keyframes and handles. It reads the clip under
++-- the playhead and changes nothing. The report comes back as text because
++-- Resolve's free edition does not show a script's output.
++function InspectTitle(req)
++    refresh_project()
++
++    local lines, chars = {}, 0
++    local truncated = false
++    local function add(text)
++        if #lines >= 90 or chars >= 14000 then
++            truncated = true
++            return
++        end
++        lines[#lines + 1] = text
++        chars = chars + #text
++    end
++    local function attrs_of(object)
++        local ok, attrs = pcall(function() return object:GetAttrs() end)
++        if ok and type(attrs) == "table" then return attrs end
++        return {}
++    end
++
++    local result
++    local ok, err = pcall(function()
++        result = (function()
++            local timeline = project:GetCurrentTimeline()
++            if not timeline then
++                return make_error("Nothing to inspect", "No active timeline in Resolve", "no_item")
++            end
++            local itemOk, item = pcall(function() return timeline:GetCurrentVideoItem() end)
++            if not itemOk or not item then
++                return make_error("Nothing to inspect",
++                    "Put the playhead over the title on the timeline first.", "no_item")
++            end
++
++            local function ask(method)
++                local callOk, value = pcall(function() return item[method](item) end)
++                if callOk then return value end
++                return nil
++            end
++            add(string.format("Clip: '%s'  start %s  end %s  length %s frames",
++                tostring(ask("GetName")), tostring(ask("GetStart")), tostring(ask("GetEnd")),
++                tostring(ask("GetDuration"))))
++
++            local compCount = tonumber(ask("GetFusionCompCount")) or 0
++            if compCount < 1 then
++                add("This clip has no Fusion composition, so there is no title animation to read.")
++                return { ok = true, report = table.concat(lines, "\n") }
++            end
++
++            for compIndex = 1, math.min(compCount, 3) do
++                local compOk, comp = pcall(function() return item:GetFusionCompByIndex(compIndex) end)
++                if compOk and comp then
++                    local rateOk, rate = pcall(function() return comp:GetPrefs("Comp.FrameFormat.Rate") end)
++                    local compAttrs = attrs_of(comp)
++                    add(string.format("Composition %d: %s fps. Global range %s to %s, render range %s to %s.",
++                        compIndex, tostring(rateOk and rate or "?"),
++                        tostring(compAttrs.COMPN_GlobalStart), tostring(compAttrs.COMPN_GlobalEnd),
++                        tostring(compAttrs.COMPN_RenderStart), tostring(compAttrs.COMPN_RenderEnd)))
++
++                    local listOk, tools = pcall(function() return comp:GetToolList(false) end)
++                    if not listOk or type(tools) ~= "table" then
++                        add("  Could not list the tools in this composition.")
++                    else
++                        local entries = {}
++                        for _, tool in pairs(tools) do
++                            local attrs = attrs_of(tool)
++                            entries[#entries + 1] = {
++                                tool = tool,
++                                name = tostring(attrs.TOOLS_Name or "?"),
++                                kind = tostring(attrs.TOOLS_RegID or "?"),
++                            }
++                        end
++                        table.sort(entries, function(a, b) return a.name < b.name end)
++
++                        local summary = {}
++                        for _, entry in ipairs(entries) do
++                            summary[#summary + 1] = entry.name .. " (" .. entry.kind .. ")"
++                        end
++                        add("  Tools: " .. table.concat(summary, ", "))
++
++                        local animatedAny = false
++                        for _, entry in ipairs(entries) do
++                            local inputsOk, inputs = pcall(function() return entry.tool:GetInputList() end)
++                            local described = {}
++                            if inputsOk and type(inputs) == "table" then
++                                for _, input in pairs(inputs) do
++                                    local outOk, output = pcall(function() return input:GetConnectedOutput() end)
++                                    if outOk and output then
++                                        local inputAttrs = attrs_of(input)
++                                        local inputName = tostring(inputAttrs.INPS_Name or inputAttrs.INPS_ID or "?")
++                                        local modOk, modifier = pcall(function() return output:GetTool() end)
++                                        if modOk and modifier then
++                                            local modAttrs = attrs_of(modifier)
++                                            local modKind = tostring(modAttrs.TOOLS_RegID or "?")
++                                            local modName = tostring(modAttrs.TOOLS_Name or "?")
++                                            local detail = ""
++                                            if modKind == "BezierSpline" then
++                                                local kfOk, keyframes = pcall(function() return modifier:GetKeyFrames() end)
++                                                if kfOk and type(keyframes) == "table" then
++                                                    detail = string.format(": %d keyframes: %s",
++                                                        #keyframe_times(keyframes), describe_keyframes(keyframes))
++                                                end
++                                            else
++                                                local timesOk, times = pcall(function() return input:GetKeyFrames() end)
++                                                if timesOk and type(times) == "table" then
++                                                    local frames = {}
++                                                    for _, frame in pairs(times) do
++                                                        frames[#frames + 1] = tonumber(frame) or 0
++                                                    end
++                                                    table.sort(frames)
++                                                    if #frames > 0 then
++                                                        local shown = {}
++                                                        for _, frame in ipairs(frames) do
++                                                            shown[#shown + 1] = string.format("%.2f", frame)
++                                                        end
++                                                        detail = ": keyframe times " .. table.concat(shown, ", ")
++                                                    end
++                                                end
++                                            end
++                                            described[#described + 1] = string.format("    %s is driven by %s '%s'%s",
++                                                inputName, modKind, modName, detail)
++                                        end
++                                    end
++                                end
++                            end
++                            if #described > 0 then
++                                animatedAny = true
++                                table.sort(described)
++                                add(string.format("  %s (%s) has animated inputs:", entry.name, entry.kind))
++                                for _, line in ipairs(described) do add(line) end
++                            end
++                        end
++                        if not animatedAny then
++                            add("  No tool in this composition has an animated input.")
++                        end
++                    end
++                end
++            end
++
++            -- The closing notes go in even when the report hit its size cap.
++            if truncated then lines[#lines + 1] = "(The rest was cut to keep this short.)" end
++            lines[#lines + 1] = "Keyframes set in the Edit page Inspector are not part of this composition and cannot be read here."
++            return { ok = true, report = "Title inspection v1\n" .. table.concat(lines, "\n") }
++        end)()
++    end)
++
++    if not ok then
++        return make_error("Failed to inspect the title", err)
++    end
++    return result
++end
++
  -- Which video track holds this item. Resolve hands back a fresh proxy on each
  -- call, so fall back to the unique id when identity comparison comes up empty.
  local function track_index_of_item(timeline, target)
-@@ -2805,6 +3840,10 @@ local handlers = {
+@@ -2805,6 +3996,14 @@ local handlers = {
          return { message = "Job completed", result = AddSubtitles(req) }
      end,
  
@@ -1408,11 +1564,15 @@ index 94070f5..a36f8a1 100644
 +        return { message = "Job completed", result = SyncSubtitles(req) }
 +    end,
 +
++    InspectTitle = function(req)
++        return { message = "Job completed", result = InspectTitle(req) }
++    end,
++
      Ping = function() return { message = "Pong" } end,
  
      ReloadServer = function()
 diff --git a/AutoSubs-App/src/api/resolve-api.ts b/AutoSubs-App/src/api/resolve-api.ts
-index d1b7375..303d8c8 100644
+index d1b7375..c868491 100644
 --- a/AutoSubs-App/src/api/resolve-api.ts
 +++ b/AutoSubs-App/src/api/resolve-api.ts
 @@ -1,6 +1,8 @@
@@ -1455,10 +1615,32 @@ index d1b7375..303d8c8 100644
    });
    // Top-level failure (e.g. the server-side handler's pcall caught an error).
    throwIfError(data, 'AddSubtitles');
-@@ -242,10 +254,66 @@ export async function addSubtitlesToTimeline(
+@@ -242,10 +254,88 @@ export async function addSubtitlesToTimeline(
    return data;
  }
  
++/**
++ * Ask Resolve to describe how the title under the playhead is built and
++ * animated: its tools, what drives each animated input, and every keyframe and
++ * handle. Read-only. Fails with code "no_item" when nothing is under the
++ * playhead.
++ */
++export async function inspectTitleAtPlayhead(): Promise<string> {
++  const data = await callResolve({ func: 'InspectTitle' });
++  throwIfError(data, 'InspectTitle');
++  if (data && typeof data === 'object' && data.result) {
++    throwIfError(data.result, 'InspectTitle');
++  }
++  const report =
++    data && typeof data === 'object' && data.result && typeof data.result === 'object'
++      ? (data.result as { report?: unknown }).report
++      : undefined;
++  if (typeof report !== 'string' || report.length === 0) {
++    throw new ResolveApiError('InspectTitle returned no report', undefined, 'InspectTitle');
++  }
++  return report;
++}
++
 +export interface SyncSubtitlesResult {
 +  message?: string;
 +  result?: {
@@ -1522,7 +1704,7 @@ index d1b7375..303d8c8 100644
  ): Promise<BatchApplyStyleResult> {
    const filePath = await getSubtitleDocumentPath(filename);
    const data = await callResolve({
-@@ -253,6 +321,8 @@ export async function applyStylesToTimeline(
+@@ -253,6 +343,8 @@ export async function applyStylesToTimeline(
      filePath,
      targetSpeakerId,
      presetSettings,
@@ -1532,10 +1714,15 @@ index d1b7375..303d8c8 100644
    throwIfError(data, 'BatchApplyStyle');
    return data;
 diff --git a/AutoSubs-App/src/components/captions/caption-style-section.tsx b/AutoSubs-App/src/components/captions/caption-style-section.tsx
-index d806e82..24e8461 100644
+index d806e82..05b0f84 100644
 --- a/AutoSubs-App/src/components/captions/caption-style-section.tsx
 +++ b/AutoSubs-App/src/components/captions/caption-style-section.tsx
-@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
+@@ -1,13 +1,17 @@
+ import * as React from "react";
+-import { Check, RefreshCw, Sparkles, Type } from "lucide-react";
++import { Check, RefreshCw, ScanSearch, Sparkles, Type } from "lucide-react";
+ import { useTranslation } from "react-i18next";
++import { toast } from "sonner";
  
  import { Button } from "@/components/ui/button";
  import { Label } from "@/components/ui/label";
@@ -1543,15 +1730,40 @@ index d806e82..24e8461 100644
  import { Spinner } from "@/components/ui/spinner";
  import { PresetGallery } from "@/components/captions/preset-gallery";
  import type { CaptionPresetActions } from "@/components/captions/use-caption-presets";
-@@ -39,6 +40,7 @@ export function CaptionStyleSection({
+ import type { ResolveTemplatesState } from "@/components/captions/use-resolve-templates";
++import { inspectTitleAtPlayhead, ResolveApiError } from "@/api/resolve-api";
++import { showTitleInspection } from "@/lib/keyframe-report";
+ import { useSettingsStore } from "@/stores/settings-store";
+ import { cn } from "@/lib/utils";
+ import type { CaptionPreset, CaptionStyle } from "@/types";
+@@ -39,6 +43,26 @@ export function CaptionStyleSection({
  }: CaptionStyleSectionProps) {
      const { t } = useTranslation();
      const updateSetting = useSettingsStore((s) => s.updateSetting);
 +    const fitTitleKeyframes = useSettingsStore((s) => s.fitTitleKeyframes);
++    const [isInspecting, setIsInspecting] = React.useState(false);
++
++    // Describe how the title under the playhead is animated, for whoever is
++    // helping to get its keyframes right.
++    async function handleInspectTitle() {
++        setIsInspecting(true);
++        try {
++            showTitleInspection(await inspectTitleAtPlayhead());
++        } catch (err) {
++            console.error("Failed to inspect the title:", err);
++            if (err instanceof ResolveApiError && err.code === "no_item") {
++                toast.info(t("captions.inspect.noClip"));
++            } else {
++                toast.error(t("captions.inspect.failed"));
++            }
++        } finally {
++            setIsInspecting(false);
++        }
++    }
  
      const source = captionStyle.source;
  
-@@ -101,6 +103,26 @@ export function CaptionStyleSection({
+@@ -101,6 +125,45 @@ export function CaptionStyleSection({
                      }
                  />
              )}
@@ -1575,6 +1787,25 @@ index d806e82..24e8461 100644
 +                    }
 +                />
 +            </div>
++
++            {isConnected && (
++                <div className="flex items-center justify-between gap-3 rounded-lg border p-3">
++                    <p className="text-xs text-muted-foreground">
++                        {t("captions.inspect.hint")}
++                    </p>
++                    <Button
++                        type="button"
++                        variant="outline"
++                        size="sm"
++                        className="shrink-0"
++                        disabled={isInspecting}
++                        onClick={handleInspectTitle}
++                    >
++                        {isInspecting ? <Spinner className="size-4" /> : <ScanSearch className="size-4" />}
++                        {t("captions.inspect.button")}
++                    </Button>
++                </div>
++            )}
          </section>
      );
  }
@@ -2343,7 +2574,7 @@ index b810376..b32bdbb 100644
        flushPendingSubtitleSave,
        processTranscriptionResults,
 diff --git a/AutoSubs-App/src/i18n/locales/de/translation.json b/AutoSubs-App/src/i18n/locales/de/translation.json
-index 179e8a2..64c13ba 100644
+index 179e8a2..e38c230 100644
 --- a/AutoSubs-App/src/i18n/locales/de/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/de/translation.json
 @@ -487,6 +487,12 @@
@@ -2359,7 +2590,7 @@ index 179e8a2..64c13ba 100644
      "previousSubtitles": "Untertitelverlauf",
      "empty": {
        "noSubtitlesAvailable": "Deine Untertitel werden hier angezeigt, sobald die Transkription abgeschlossen ist"
-@@ -637,6 +643,33 @@
+@@ -637,6 +643,41 @@
        "partial": "{{updated}} aktualisiert, {{failed}} fehlgeschlagen",
        "failed": "Timeline-Stile konnten nicht geändert werden"
      },
@@ -2390,11 +2621,19 @@ index 179e8a2..64c13ba 100644
 +      "copied": "In die Zwischenablage kopiert",
 +      "copyFailed": "Kopieren fehlgeschlagen. Mach stattdessen einen Screenshot."
 +    },
++    "inspect": {
++      "button": "Titel am Abspielkopf untersuchen",
++      "hint": "Lege einen deiner Titel auf die Timeline, stelle den Abspielkopf darauf und drücke dies, um genau zu sehen, wie er animiert ist.",
++      "title": "Titel-Untersuchung",
++      "description": "Kopiere dies und sende es an die Person, die dir hilft.",
++      "noClip": "Stelle den Abspielkopf zuerst auf einen Titel in der Timeline.",
++      "failed": "Der Titel konnte nicht untersucht werden."
++    },
      "send": {
        "adding": "Wird gesendet...",
        "placedPartial": "{{placed}} von {{total}} Untertiteln platziert",
 diff --git a/AutoSubs-App/src/i18n/locales/en/translation.json b/AutoSubs-App/src/i18n/locales/en/translation.json
-index f59edad..06d5778 100644
+index f59edad..5f55ba5 100644
 --- a/AutoSubs-App/src/i18n/locales/en/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/en/translation.json
 @@ -507,6 +507,12 @@
@@ -2410,7 +2649,7 @@ index f59edad..06d5778 100644
      "previousSubtitles": "Subtitle History",
      "empty": {
        "noSubtitlesAvailable": "Your subtitles will appear here when finished transcribing"
-@@ -657,6 +663,33 @@
+@@ -657,6 +663,41 @@
        "partial": "Updated {{updated}} clips, {{failed}} failed",
        "failed": "Couldn't update timeline styles"
      },
@@ -2441,11 +2680,19 @@ index f59edad..06d5778 100644
 +      "copied": "Copied to clipboard",
 +      "copyFailed": "Couldn't copy. Take a screenshot instead."
 +    },
++    "inspect": {
++      "button": "Inspect title at playhead",
++      "hint": "Put one of your titles on the timeline, park the playhead on it, then press this to see exactly how it is animated.",
++      "title": "Title inspection",
++      "description": "Copy this and send it to whoever is helping you.",
++      "noClip": "Put the playhead over a title on the timeline first.",
++      "failed": "Couldn't inspect the title."
++    },
      "send": {
        "adding": "Sending...",
        "placedPartial": "Placed {{placed}} of {{total}} subtitles",
 diff --git a/AutoSubs-App/src/i18n/locales/es/translation.json b/AutoSubs-App/src/i18n/locales/es/translation.json
-index 8db6c5d..f417170 100644
+index 8db6c5d..c263282 100644
 --- a/AutoSubs-App/src/i18n/locales/es/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/es/translation.json
 @@ -487,6 +487,12 @@
@@ -2461,7 +2708,7 @@ index 8db6c5d..f417170 100644
      "previousSubtitles": "Historial de subtítulos",
      "empty": {
        "noSubtitlesAvailable": "Tus subtítulos aparecerán aquí cuando termine la transcripción"
-@@ -637,6 +643,33 @@
+@@ -637,6 +643,41 @@
        "partial": "{{updated}} actualizados, {{failed}} con error",
        "failed": "No se pudieron actualizar los estilos"
      },
@@ -2492,11 +2739,19 @@ index 8db6c5d..f417170 100644
 +      "copied": "Copiado al portapapeles",
 +      "copyFailed": "No se pudo copiar. Haz una captura de pantalla."
 +    },
++    "inspect": {
++      "button": "Inspeccionar el título en el cabezal",
++      "hint": "Coloca uno de tus títulos en la línea de tiempo, sitúa el cabezal sobre él y pulsa esto para ver exactamente cómo está animado.",
++      "title": "Inspección del título",
++      "description": "Copia esto y envíalo a quien te esté ayudando.",
++      "noClip": "Primero coloca el cabezal sobre un título en la línea de tiempo.",
++      "failed": "No se pudo inspeccionar el título."
++    },
      "send": {
        "adding": "Enviando...",
        "placedPartial": "Colocados {{placed}} de {{total}} subtítulos",
 diff --git a/AutoSubs-App/src/i18n/locales/fr/translation.json b/AutoSubs-App/src/i18n/locales/fr/translation.json
-index eaf79f0..625548f 100644
+index eaf79f0..4da3588 100644
 --- a/AutoSubs-App/src/i18n/locales/fr/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/fr/translation.json
 @@ -487,6 +487,12 @@
@@ -2512,7 +2767,7 @@ index eaf79f0..625548f 100644
      "previousSubtitles": "Historique des sous-titres",
      "empty": {
        "noSubtitlesAvailable": "Vos sous-titres apparaîtront ici une fois la transcription terminée"
-@@ -637,6 +643,33 @@
+@@ -637,6 +643,41 @@
        "partial": "{{updated}} actualisés, {{failed}} en échec",
        "failed": "Impossible d’actualiser les styles"
      },
@@ -2543,11 +2798,19 @@ index eaf79f0..625548f 100644
 +      "copied": "Copié dans le presse-papiers",
 +      "copyFailed": "Copie impossible. Faites plutôt une capture d'écran."
 +    },
++    "inspect": {
++      "button": "Inspecter le titre sous la tête de lecture",
++      "hint": "Placez l'un de vos titres sur la timeline, positionnez la tête de lecture dessus, puis appuyez ici pour voir exactement comment il est animé.",
++      "title": "Inspection du titre",
++      "description": "Copiez ceci et envoyez-le à la personne qui vous aide.",
++      "noClip": "Placez d'abord la tête de lecture sur un titre de la timeline.",
++      "failed": "Impossible d'inspecter le titre."
++    },
      "send": {
        "adding": "Envoi en cours...",
        "placedPartial": "{{placed}} sous-titres placés sur {{total}}",
 diff --git a/AutoSubs-App/src/i18n/locales/ja/translation.json b/AutoSubs-App/src/i18n/locales/ja/translation.json
-index 1bfdb8d..0642ece 100644
+index 1bfdb8d..0b177c7 100644
 --- a/AutoSubs-App/src/i18n/locales/ja/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/ja/translation.json
 @@ -504,6 +504,12 @@
@@ -2563,7 +2826,7 @@ index 1bfdb8d..0642ece 100644
      "previousSubtitles": "字幕履歴",
      "status": {
        "count_one": "字幕 {{count}} 件",
-@@ -637,6 +643,33 @@
+@@ -637,6 +643,41 @@
        "partial": "{{updated}}件更新、{{failed}}件失敗",
        "failed": "タイムラインのスタイルを更新できませんでした"
      },
@@ -2594,11 +2857,19 @@ index 1bfdb8d..0642ece 100644
 +      "copied": "クリップボードにコピーしました",
 +      "copyFailed": "コピーできませんでした。代わりにスクリーンショットを撮ってください。"
 +    },
++    "inspect": {
++      "button": "再生ヘッド位置のタイトルを調べる",
++      "hint": "タイトルをタイムラインに置き、再生ヘッドをその上に合わせてから押すと、アニメーションの正確な構成を確認できます。",
++      "title": "タイトルの調査結果",
++      "description": "これをコピーして手伝ってくれている人に送ってください。",
++      "noClip": "先にタイムライン上のタイトルに再生ヘッドを合わせてください。",
++      "failed": "タイトルを調べられませんでした。"
++    },
      "send": {
        "adding": "送信中...",
        "placedPartial": "{{total}}件中{{placed}}件の字幕を配置しました",
 diff --git a/AutoSubs-App/src/i18n/locales/ko/translation.json b/AutoSubs-App/src/i18n/locales/ko/translation.json
-index e3bf390..fc9fde8 100644
+index e3bf390..9353d20 100644
 --- a/AutoSubs-App/src/i18n/locales/ko/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/ko/translation.json
 @@ -503,6 +503,12 @@
@@ -2614,7 +2885,7 @@ index e3bf390..fc9fde8 100644
      "previousSubtitles": "자막 기록",
      "waitingForSubtitles": "자막을 기다리는 중...",
      "status": {
-@@ -637,6 +643,33 @@
+@@ -637,6 +643,41 @@
        "partial": "{{updated}}개 업데이트, {{failed}}개 실패",
        "failed": "타임라인 스타일을 업데이트하지 못했습니다"
      },
@@ -2645,11 +2916,19 @@ index e3bf390..fc9fde8 100644
 +      "copied": "클립보드에 복사되었습니다",
 +      "copyFailed": "복사하지 못했습니다. 대신 스크린샷을 찍어 주세요."
 +    },
++    "inspect": {
++      "button": "재생헤드 위치의 제목 검사",
++      "hint": "제목을 타임라인에 놓고 재생헤드를 그 위에 둔 다음 누르면 애니메이션 구성을 정확히 확인할 수 있습니다.",
++      "title": "제목 검사 결과",
++      "description": "이 내용을 복사해 도와주는 분께 보내 주세요.",
++      "noClip": "먼저 타임라인의 제목 위에 재생헤드를 놓으세요.",
++      "failed": "제목을 검사하지 못했습니다."
++    },
      "send": {
        "adding": "전송 중...",
        "placedPartial": "자막 {{total}}개 중 {{placed}}개 배치",
 diff --git a/AutoSubs-App/src/i18n/locales/ru/translation.json b/AutoSubs-App/src/i18n/locales/ru/translation.json
-index 7eeafc1..25589f5 100644
+index 7eeafc1..18eafff 100644
 --- a/AutoSubs-App/src/i18n/locales/ru/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/ru/translation.json
 @@ -497,6 +497,12 @@
@@ -2665,7 +2944,7 @@ index 7eeafc1..25589f5 100644
      "previousSubtitles": "История субтитров",
      "empty": {
        "noSubtitlesAvailable": "Здесь появятся субтитры после завершения транскрибации"
-@@ -647,6 +653,33 @@
+@@ -647,6 +653,41 @@
        "partial": "Обновлено: {{updated}}, ошибок: {{failed}}",
        "failed": "Не удалось обновить стили таймлайна"
      },
@@ -2696,11 +2975,19 @@ index 7eeafc1..25589f5 100644
 +      "copied": "Скопировано в буфер обмена",
 +      "copyFailed": "Не удалось скопировать. Сделайте скриншот."
 +    },
++    "inspect": {
++      "button": "Изучить титр под курсором",
++      "hint": "Поместите титр на таймлайн, поставьте на него курсор воспроизведения и нажмите, чтобы точно увидеть, как он анимирован.",
++      "title": "Сведения о титре",
++      "description": "Скопируйте это и отправьте тому, кто вам помогает.",
++      "noClip": "Сначала поставьте курсор воспроизведения на титр на таймлайне.",
++      "failed": "Не удалось изучить титр."
++    },
      "send": {
        "adding": "Отправка...",
        "placedPartial": "Размещено {{placed}} из {{total}} субтитров",
 diff --git a/AutoSubs-App/src/i18n/locales/zh/translation.json b/AutoSubs-App/src/i18n/locales/zh/translation.json
-index dbaea54..04a6f74 100644
+index dbaea54..6b76b96 100644
 --- a/AutoSubs-App/src/i18n/locales/zh/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/zh/translation.json
 @@ -487,6 +487,12 @@
@@ -2716,7 +3003,7 @@ index dbaea54..04a6f74 100644
      "previousSubtitles": "字幕历史",
      "empty": {
        "noSubtitlesAvailable": "转录完成后，字幕将显示在这里"
-@@ -637,6 +643,33 @@
+@@ -637,6 +643,41 @@
        "partial": "已更新 {{updated}} 个，失败 {{failed}} 个",
        "failed": "无法更新时间线样式"
      },
@@ -2747,30 +3034,36 @@ index dbaea54..04a6f74 100644
 +      "copied": "已复制到剪贴板",
 +      "copyFailed": "无法复制，请改为截图。"
 +    },
++    "inspect": {
++      "button": "检查播放头处的标题",
++      "hint": "将标题放到时间线上，把播放头停在其上，然后点击此处，即可准确查看它的动画结构。",
++      "title": "标题检查结果",
++      "description": "复制这些内容并发送给协助您的人。",
++      "noClip": "请先把播放头放在时间线上的标题上。",
++      "failed": "无法检查该标题。"
++    },
      "send": {
        "adding": "正在发送...",
        "placedPartial": "已放置 {{total}} 条字幕中的 {{placed}} 条",
 diff --git a/AutoSubs-App/src/lib/keyframe-report.ts b/AutoSubs-App/src/lib/keyframe-report.ts
 new file mode 100644
-index 0000000..c6662b1
+index 0000000..c9ab746
 --- /dev/null
 +++ b/AutoSubs-App/src/lib/keyframe-report.ts
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,54 @@
 +import { toast } from "sonner";
 +import i18n from "@/i18n";
 +
 +/**
-+ * Show what the title-animation fitting did, with a button to copy it.
++ * Show a block of text with a button that copies it.
 + *
 + * The Resolve script's own output is not visible in the free edition of
-+ * Resolve, so the details come back with the result and are shown here. The
-+ * notification stays until it is dismissed so it cannot be missed.
++ * Resolve, so what it has to say comes back with the result and is shown here.
++ * The notification stays until it is dismissed so it cannot be missed.
 + */
-+export function showKeyframeReport(report: string | null | undefined) {
-+  if (!report) return;
-+
-+  toast.info(i18n.t("captions.keyframeReport.title"), {
-+    description: i18n.t("captions.keyframeReport.description"),
++function showCopyableReport(report: string, title: string, description: string) {
++  toast.info(title, {
++    description,
 +    duration: Infinity,
 +    closeButton: true,
 +    action: {
@@ -2780,7 +3073,7 @@ index 0000000..c6662b1
 +          await navigator.clipboard.writeText(report);
 +          toast.success(i18n.t("captions.keyframeReport.copied"));
 +        } catch (err) {
-+          console.error("Could not copy the title animation details:", err);
++          console.error("Could not copy the report:", err);
 +          // Show the text itself so it can be read or photographed instead.
 +          toast.error(i18n.t("captions.keyframeReport.copyFailed"), {
 +            description: report,
@@ -2791,6 +3084,26 @@ index 0000000..c6662b1
 +      },
 +    },
 +  });
++}
++
++/** What fitting a title's animation to a caption did. */
++export function showKeyframeReport(report: string | null | undefined) {
++  if (!report) return;
++  showCopyableReport(
++    report,
++    i18n.t("captions.keyframeReport.title"),
++    i18n.t("captions.keyframeReport.description"),
++  );
++}
++
++/** How a title is built and animated, from the inspector. */
++export function showTitleInspection(report: string | null | undefined) {
++  if (!report) return;
++  showCopyableReport(
++    report,
++    i18n.t("captions.inspect.title"),
++    i18n.t("captions.inspect.description"),
++  );
 +}
 diff --git a/AutoSubs-App/src/lib/line-styles.ts b/AutoSubs-App/src/lib/line-styles.ts
 new file mode 100644
@@ -3131,7 +3444,7 @@ index 0c2f602..eab30de 100644
  
    for (const subtitle of normalizedSubtitles) {
 diff --git a/AutoSubs-App/tests/mock_resolve_test.lua b/AutoSubs-App/tests/mock_resolve_test.lua
-index d7006f8..9b60472 100644
+index d7006f8..441f675 100644
 --- a/AutoSubs-App/tests/mock_resolve_test.lua
 +++ b/AutoSubs-App/tests/mock_resolve_test.lua
 @@ -23,6 +23,7 @@ local function make_tool()
@@ -3269,7 +3582,7 @@ index d7006f8..9b60472 100644
                  table.insert(track.items, item and { handle = item } or nil)
                  results[i] = item
              end
-@@ -747,5 +847,880 @@ do
+@@ -747,5 +847,1027 @@ do
      check_marker_move(2, 50, 38, "marker move with lead-in")
  end
  
@@ -4145,6 +4458,153 @@ index d7006f8..9b60472 100644
 +            "keyframes/toggle: and come back as authored", created[1] and show(times_of(created[1])))
 +        local again = sync(captions(1.5), { fitTitleKeyframes = false })
 +        check(again.ok == true and again.unchanged == 3, "keyframes/toggle: a second sync changes nothing", tostring(again.unchanged))
++    end
++end
++
++-- InspectTitle: report how a title is built and animated ------------------------
++do
++    -- A Fusion tool with the pieces the inspector reads. `animated` maps an input name to
++    -- { kind = "BezierSpline" | "XYPath" | ..., name = ..., spline = <make_spline>, times = {...} }.
++    local function make_tool(name, regId, animated)
++        local inputs = {}
++        for inputName, driver in pairs(animated or {}) do
++            local modifier = driver.spline or {
++                GetAttrs = function() return { TOOLS_RegID = driver.kind, TOOLS_Name = driver.name } end,
++            }
++            inputs[#inputs + 1] = {
++                GetAttrs = function() return { INPS_Name = inputName, INPS_ID = inputName } end,
++                GetConnectedOutput = function() return { GetTool = function() return modifier end } end,
++                GetKeyFrames = function()
++                    local out = {}
++                    for i, t in ipairs(driver.times or {}) do out[i] = t end
++                    return out
++                end,
++            }
++        end
++        inputs[#inputs + 1] = { -- a plain, unanimated input
++            GetAttrs = function() return { INPS_Name = "Blend", INPS_ID = "Blend" } end,
++            GetConnectedOutput = function() return nil end,
++        }
++        return {
++            GetAttrs = function() return { TOOLS_Name = name, TOOLS_RegID = regId } end,
++            GetInputList = function() return inputs end,
++        }
++    end
++    local function make_inspected(tools, compOpts)
++        compOpts = compOpts or {}
++        local comp = {
++            GetPrefs = function() return compOpts.rate or 60 end,
++            GetAttrs = function() return { COMPN_GlobalStart = 0, COMPN_GlobalEnd = 112, COMPN_RenderStart = 0, COMPN_RenderEnd = 112 } end,
++            GetToolList = function() return tools end,
++        }
++        return {
++            GetName = function() return "Punch Out" end,
++            GetStart = function() return 86400 end,
++            GetEnd = function() return 86513 end,
++            GetDuration = function() return 113 end,
++            GetFusionCompCount = function() return compOpts.noComp and 0 or 1 end,
++            GetFusionCompByIndex = function() return comp end,
++        }
++    end
++    local function inspect_with(item)
++        tl = make_timeline { trackCount = 1 }
++        mp = make_media_pool(tl, {})
++        wire_project(tl, mp)
++        tl.GetCurrentVideoItem = function() return item end
++        return InspectTitle({ func = "InspectTitle" })
++    end
++
++    -- The title this was reported on, plus the kinds of animation other titles use.
++    do
++        print("\n=== inspect: a title with several kinds of animation ===")
++        local punch = make_spline({
++            [0] = { 0, RH = { 0.2, 1.4 } },
++            [7] = { 1, LH = { -7.94, -0.005 }, RH = { 12.68, 0 } },
++            [88] = { 1, LH = { -26.2, -5e-15 }, RH = { 8, 0 } },
++            [98] = { 0, LH = { -0.2, 1.39 } },
++        }, "Transform1Size")
++        local ofxZoom = make_spline({ [0] = { 1 }, [30] = { 1.5 } }, "ResolveFXZoom")
++        local item = make_inspected({
++            make_tool("MediaIn1", "MediaIn"),
++            make_tool("Template", "TextPlus"),
++            make_tool("Transform1", "Transform", {
++                Size = { spline = punch },
++                Center = { kind = "XYPath", name = "Path1", times = { 0, 40, 98 } },
++            }),
++            make_tool("Wiggle1", "ofx.com.blackmagicdesign.resolvefx.Transform", { Zoom = { spline = ofxZoom } }),
++        })
++        local r = inspect_with(item)
++        local report = r.report or ""
++        check(r.ok == true, "inspect/full: succeeds", tostring(r.error) .. " " .. tostring(r.detail))
++        check(report:find("Title inspection v1", 1, true) ~= nil, "inspect/full: says which version ran")
++        check(report:find("Clip: 'Punch Out'", 1, true) ~= nil and report:find("length 113 frames", 1, true) ~= nil,
++            "inspect/full: names the clip and its length", report)
++        check(report:find("Composition 1: 60 fps", 1, true) ~= nil and report:find("Global range 0 to 112", 1, true) ~= nil,
++            "inspect/full: gives the frame rate and time range", report)
++        check(report:find("MediaIn1 (MediaIn)", 1, true) ~= nil and report:find("Template (TextPlus)", 1, true) ~= nil
++            and report:find("Transform1 (Transform)", 1, true) ~= nil, "inspect/full: lists every tool and its type", report)
++        check(report:find("Size is driven by BezierSpline 'Transform1Size': 4 keyframes", 1, true) ~= nil,
++            "inspect/full: finds the Transform's spline", report)
++        check(report:find("0.00=0 RH(0.20,1.4)", 1, true) ~= nil and report:find("98.00=0 LH(-0.20,1.39)", 1, true) ~= nil,
++            "inspect/full: with every keyframe and handle", report)
++        check(report:find("Center is driven by XYPath 'Path1': keyframe times 0.00, 40.00, 98.00", 1, true) ~= nil,
++            "inspect/full: reports a path it cannot move, with its key times", report)
++        check(report:find("Wiggle1 (ofx.com.blackmagicdesign.resolvefx.Transform) has animated inputs", 1, true) ~= nil
++            and report:find("Zoom is driven by BezierSpline 'ResolveFXZoom': 2 keyframes", 1, true) ~= nil,
++            "inspect/full: reads an OpenFX tool's animation too", report)
++        check(report:find("Blend is driven", 1, true) == nil, "inspect/full: leaves unanimated inputs out")
++        check(report:find("Edit page Inspector", 1, true) ~= nil, "inspect/full: says what it cannot read")
++    end
++
++    -- A title with nothing animated.
++    do
++        print("\n=== inspect: a static title ===")
++        local r = inspect_with(make_inspected({ make_tool("MediaIn1", "MediaIn"), make_tool("Template", "TextPlus") }))
++        check(r.ok == true and (r.report or ""):find("No tool in this composition has an animated input", 1, true) ~= nil,
++            "inspect/static: says nothing is animated", tostring(r.report))
++    end
++
++    -- Nothing under the playhead.
++    do
++        print("\n=== inspect: nothing under the playhead ===")
++        local r = inspect_with(nil)
++        check(r.error ~= nil and r.code == "no_item", "inspect/none: asks for the playhead to be put over a title",
++            tostring(r.error) .. " / " .. tostring(r.code))
++    end
++
++    -- A clip with no Fusion composition (an ordinary video clip).
++    do
++        print("\n=== inspect: a clip with no composition ===")
++        local r = inspect_with(make_inspected({}, { noComp = true }))
++        check(r.ok == true and (r.report or ""):find("no Fusion composition", 1, true) ~= nil,
++            "inspect/nocomp: says there is nothing to read", tostring(r.report))
++    end
++
++    -- Odd Fusion objects must never make it fail.
++    do
++        print("\n=== inspect: objects that misbehave ===")
++        local broken = {
++            GetAttrs = function() error("boom") end,
++            GetInputList = function() error("boom") end,
++        }
++        local r = inspect_with(make_inspected({ broken, make_tool("Template", "TextPlus") }))
++        check(r.ok == true and (r.report or ""):find("Template (TextPlus)", 1, true) ~= nil,
++            "inspect/broken: still reports what it can", tostring(r.error) .. " " .. tostring(r.report))
++    end
++
++    -- A huge composition is cut rather than flooding the report.
++    do
++        print("\n=== inspect: a very large composition ===")
++        local many = {}
++        for i = 1, 200 do
++            many[#many + 1] = make_tool("Node" .. i, "Transform", {
++                Size = { spline = make_spline({ [0] = { 0 }, [10] = { 1 } }, "Spline" .. i) },
++            })
++        end
++        local r = inspect_with(make_inspected(many))
++        local lineCount = select(2, (r.report or ""):gsub("\n", "\n"))
++        check(r.ok == true and lineCount < 110 and (r.report or ""):find("cut to keep this short", 1, true) ~= nil,
++            "inspect/large: the report is cut", lineCount)
 +    end
 +end
 +
