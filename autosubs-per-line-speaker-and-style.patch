@@ -759,12 +759,13 @@ index 0000000..a9186bd
 +assert.deepEqual(gone?.segmentTemplates, { '0': 'Deleted Title' });
 diff --git a/AutoSubs-App/scripts/script-check.test.ts b/AutoSubs-App/scripts/script-check.test.ts
 new file mode 100644
-index 0000000..8fcb0ae
+index 0000000..c1dd031
 --- /dev/null
 +++ b/AutoSubs-App/scripts/script-check.test.ts
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,137 @@
 +import assert from 'node:assert/strict';
 +import fs from 'node:fs';
++import os from 'node:os';
 +import path from 'node:path';
 +import { ensureScriptCurrent, parseScriptBuild } from '../src/lib/script-check.ts';
 +import { MODULES_DIR, STAMP_FILE, computeStamp, parseStamp, stampSource, stampedModules } from './stamp-resolve-script.js';
@@ -858,7 +859,7 @@ index 0000000..8fcb0ae
 +
 +// Line endings do not change it; contents do.
 +{
-+    const dir = fs.mkdtempSync(path.join(fs.realpathSync(process.env.TMPDIR ?? '/tmp'), 'stamp-'));
++    const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'stamp-'));
 +    fs.writeFileSync(path.join(dir, 'a.lua'), 'local x = 1\nreturn x\n');
 +    fs.writeFileSync(path.join(dir, STAMP_FILE), stampSource('ffffffffffff'));
 +    const unix = computeStamp(dir);
@@ -1070,7 +1071,7 @@ index 0000000..c539612
 +assert.deepEqual(sidesOfSplit([14, 35, 40, 112, 119], 40), { intro: [14, 35, 40], outro: [112, 119] });
 diff --git a/AutoSubs-App/scripts/translations-parts45.test.ts b/AutoSubs-App/scripts/translations-parts45.test.ts
 new file mode 100644
-index 0000000..f4d0394
+index 0000000..0c563e6
 --- /dev/null
 +++ b/AutoSubs-App/scripts/translations-parts45.test.ts
 @@ -0,0 +1,45 @@
@@ -1116,7 +1117,7 @@ index 0000000..f4d0394
 +        assert.ok(String(get(d, `${counted}_${form}`)).includes('{{count}}'), `${lang}: ${counted}_${form}`);
 +    }
 +    // Saved the way the project formats its locale files.
-+    const text = fs.readFileSync(new URL(`../src/i18n/locales/${lang}/translation.json`, import.meta.url), 'utf8');
++    const text = fs.readFileSync(new URL(`../src/i18n/locales/${lang}/translation.json`, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 +    assert.equal(text, JSON.stringify(d, null, 2) + '\n', `${lang}: file formatting`);
 +}
 diff --git a/AutoSubs-App/src-tauri/resources/modules/autosubs_core.lua b/AutoSubs-App/src-tauri/resources/modules/autosubs_core.lua
