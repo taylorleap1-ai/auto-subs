@@ -1,3 +1,327 @@
+diff --git a/AutoSubs-App/scripts/caption-timing.test.ts b/AutoSubs-App/scripts/caption-timing.test.ts
+new file mode 100644
+index 0000000..92ca17d
+--- /dev/null
++++ b/AutoSubs-App/scripts/caption-timing.test.ts
+@@ -0,0 +1,318 @@
++import assert from 'node:assert/strict';
++import {
++    formatPreciseTime,
++    insertCaption,
++    parseTimeInput,
++    retimeWords,
++    setCaptionTiming,
++    shiftCaptions,
++    suggestInsertSlot,
++    wordsForText,
++} from '../src/lib/caption-timing.ts';
++import { findPresetOverride, remapPresetOverrides } from '../src/lib/line-styles.ts';
++import { preserveSubtitleEdits } from '../src/utils/subtitle-edits.ts';
++import type { Subtitle } from '../src/types.ts';
++
++function cue(text: string, start: number, speaker = '1'): Subtitle {
++    const tokens = text.split(' ');
++    return { id: start, start, end: start + tokens.length, text, speaker_id: speaker,
++        words: tokens.map((word, index) => ({ word: index ? ` ${word}` : word,
++            start: start + index, end: start + index + 1, line_number: 0 })) };
++}
++const close = (a: number, b: number) => Math.abs(a - b) < 1e-9;
++const times = (c: Subtitle) => c.words.map(w => [Number(w.start), Number(w.end)]);
++const texts = (list: Subtitle[]) => list.map(c => c.text);
++const snapshotOf = (list: Subtitle[]) => JSON.stringify(list);
++
++// Captions: "a b" 0-2, "c d" 5-7, "e f" 10-12.
++// Ids follow position, as they do in the app.
++const three = () => [cue('a b', 0), cue('c d', 5), cue('e f', 10)].map((c, id) => ({ ...c, id }));
++
++// ---- retimeWords: words keep their place within the caption -------------------------
++{
++    const moved = retimeWords(cue('a b', 0).words, 0, 2, 10, 14);
++    assert.deepEqual(moved.map(w => [w.start, w.end]), [[10, 12], [12, 14]]);
++    const even = retimeWords(cue('a b', 0).words, 3, 3, 0, 4); // a caption with no length
++    assert.deepEqual(even.map(w => [w.start, w.end]), [[0, 2], [2, 4]]);
++}
++
++// ---- setCaptionTiming --------------------------------------------------------------
++{
++    const list = three();
++    const before = snapshotOf(list);
++    const r = setCaptionTiming(list, 1, 4, 8, false);
++    assert.equal(r.error, undefined);
++    assert.equal(r.subtitles[1].start, 4);
++    assert.equal(r.subtitles[1].end, 8);
++    assert.deepEqual(times(r.subtitles[1]), [[4, 6], [6, 8]], 'words stretch with the caption');
++    assert.equal(r.subtitles[0], list[0], 'the others are untouched');
++    assert.equal(r.subtitles[2], list[2]);
++    assert.equal(r.shift, undefined);
++    assert.equal(snapshotOf(list), before, 'the input list is never changed');
++
++    assert.equal(setCaptionTiming(three(), 1, 1.5, 6, false).error, 'overlapsPrevious');
++    assert.equal(setCaptionTiming(three(), 1, 5, 10.5, false).error, 'overlapsNext');
++    assert.equal(setCaptionTiming(three(), 1, 6, 6, false).error, 'tooShort');
++    assert.equal(setCaptionTiming(three(), 1, 6, 5, false).error, 'tooShort');
++    assert.equal(setCaptionTiming(three(), 0, -1, 2, false).error, 'beforeStart');
++    assert.equal(setCaptionTiming(three(), 1, Number.NaN, 6, false).error, 'invalid');
++    // Touching a neighbour exactly is fine.
++    assert.equal(setCaptionTiming(three(), 1, 2, 10, false).error, undefined);
++
++    // Extending a caption and moving the later ones keeps their gaps.
++    const later = setCaptionTiming(three(), 1, 5, 11, true);
++    assert.equal(later.error, undefined);
++    assert.equal(later.subtitles[2].start, 14);
++    assert.equal(later.subtitles[2].end, 16);
++    assert.deepEqual(times(later.subtitles[2]), [[14, 15], [15, 16]]);
++    assert.deepEqual(later.shift, { from: 10, offset: 4 });
++    // ...and shortening it pulls them earlier.
++    const pulled = setCaptionTiming(three(), 1, 5, 6, true);
++    assert.equal(pulled.subtitles[2].start, 9);
++    assert.deepEqual(pulled.shift, { from: 10, offset: -1 });
++    // Only the start moved: nothing after it needs to move.
++    assert.equal(setCaptionTiming(three(), 1, 4, 7, true).shift, undefined);
++}
++
++// ---- shiftCaptions -----------------------------------------------------------------
++{
++    const all = shiftCaptions(three(), 0, 2);
++    assert.deepEqual(all.subtitles.map(c => [c.start, c.end]), [[2, 4], [7, 9], [12, 14]]);
++    assert.deepEqual(times(all.subtitles[0]), [[2, 3], [3, 4]]);
++    assert.equal(all.appliedOffset, 2);
++    assert.equal(all.clamped, false);
++    assert.deepEqual(all.shift, { from: 0, offset: 2 });
++
++    // Earlier than 0 is not possible: it stops at 0 and says so.
++    const early = shiftCaptions(three(), 0, -3);
++    assert.equal(early.appliedOffset, 0);
++    assert.equal(early.clamped, true);
++    assert.equal(early.subtitles[0].start, 0);
++
++    // From the middle: only that caption and those after it move.
++    const tail = shiftCaptions(three(), 1, 1.5);
++    assert.deepEqual(tail.subtitles.map(c => c.start), [0, 6.5, 11.5]);
++    // ...and they cannot be pulled back past the caption before them.
++    const back = shiftCaptions(three(), 1, -10);
++    assert.equal(back.appliedOffset, -3);
++    assert.equal(back.clamped, true);
++    assert.deepEqual(back.subtitles.map(c => c.start), [0, 2, 7]);
++
++    assert.equal(shiftCaptions(three(), 7, 1).error, 'invalid');
++}
++
++// ---- insertCaption -----------------------------------------------------------------
++{
++    const list = three();
++    const r = insertCaption(list, 1, { text: '  hello   there ', start: 2.5, end: 4.5, speakerId: '2' }, false);
++    assert.equal(r.error, undefined);
++    assert.equal(r.index, 1);
++    assert.deepEqual(texts(r.subtitles), ['a b', 'hello there', 'c d', 'e f']);
++    const added = r.subtitles[1];
++    assert.equal(added.inserted, true);
++    assert.equal(added.speaker_id, '2');
++    assert.equal(added.words[0].start, 2.5);
++    assert.equal(added.words[added.words.length - 1].end, 4.5);
++    assert.deepEqual(r.subtitles.map(c => c.id), [0, 1, 2, 3], 'ids follow position');
++    assert.equal(r.shift, undefined);
++    assert.equal(list.length, 3, 'the input list is never changed');
++
++    assert.equal(insertCaption(three(), 1, { text: ' ', start: 2.5, end: 4 }, false).error, 'emptyText');
++    assert.equal(insertCaption(three(), 1, { text: 'x', start: 1, end: 4 }, false).error, 'overlapsPrevious');
++    assert.equal(insertCaption(three(), 1, { text: 'x', start: 3, end: 6 }, false).error, 'overlapsNext');
++
++    // Making room moves every later caption by the overlap.
++    const room = insertCaption(three(), 1, { text: 'x', start: 2, end: 6.5 }, true);
++    assert.equal(room.error, undefined);
++    assert.deepEqual(room.subtitles.map(c => [c.start, c.end]), [[0, 2], [2, 6.5], [6.5, 8.5], [11.5, 13.5]]);
++    assert.deepEqual(room.shift, { from: 5, offset: 1.5 });
++
++    // At the very start and the very end.
++    const first = insertCaption([cue('c d', 5)], 0, { text: 'x', start: 1, end: 3 }, false);
++    assert.deepEqual(texts(first.subtitles), ['x', 'c d']);
++    const last = insertCaption(three(), 3, { text: 'z', start: 13, end: 14 }, false);
++    assert.deepEqual(texts(last.subtitles), ['a b', 'c d', 'e f', 'z']);
++    const beyond = insertCaption(three(), 99, { text: 'z', start: 13, end: 14 }, false);
++    assert.equal(beyond.index, 3);
++}
++
++// ---- suggestInsertSlot -------------------------------------------------------------
++{
++    assert.deepEqual(suggestInsertSlot(three(), 1), { start: 2, end: 5, needsRoom: false });
++    // A long gap is capped at five seconds.
++    assert.deepEqual(suggestInsertSlot([cue('a', 0), cue('b', 20)], 1), { start: 1, end: 6, needsRoom: false });
++    // No gap: a slot that needs the later captions moved.
++    assert.deepEqual(suggestInsertSlot([cue('a b', 0), cue('c', 2)], 1), { start: 2, end: 3.5, needsRoom: true });
++    // Before the first caption, and after the last.
++    // Before a caption that starts at 0: a slot that needs the captions moved along.
++    assert.deepEqual(suggestInsertSlot(three(), 0), { start: 0, end: 1.5, needsRoom: true });
++    assert.deepEqual(suggestInsertSlot([cue('c d', 5)], 0), { start: 3.5, end: 5, needsRoom: false });
++    assert.deepEqual(suggestInsertSlot(three(), 3), { start: 12, end: 17, needsRoom: false });
++}
++
++// ---- wordsForText ------------------------------------------------------------------
++{
++    const w = wordsForText('hi there', 0, 7);
++    assert.deepEqual(w.map(x => x.word), ['hi', ' there']);
++    assert.ok(close(w[0].end, 2) && close(w[1].start, 2) && close(w[1].end, 7), 'timed by length');
++    assert.deepEqual(wordsForText('   ', 0, 1), []);
++}
++
++// ---- typing and showing times ------------------------------------------------------
++{
++    assert.equal(parseTimeInput('12.5'), 12.5);
++    assert.equal(parseTimeInput('12,5'), 12.5);
++    assert.equal(parseTimeInput('1:02.25'), 62.25);
++    assert.equal(parseTimeInput('1:02:03.5'), 3723.5);
++    assert.equal(parseTimeInput(' 0:05 '), 5);
++    assert.equal(parseTimeInput(''), null);
++    assert.equal(parseTimeInput('abc'), null);
++    assert.equal(parseTimeInput('1:75'), null);
++    assert.equal(parseTimeInput('1.5:20'), null);
++    assert.equal(parseTimeInput('-2'), null, 'no sign for a point in time');
++    assert.equal(parseTimeInput('-2', true), -2);
++    assert.equal(parseTimeInput('+0:01.5', true), 1.5);
++    assert.equal(formatPreciseTime(62.25), '1:02.250');
++    assert.equal(formatPreciseTime(3723.5), '1:02:03.500');
++    assert.equal(formatPreciseTime(0.0004), '0:00.000');
++    for (const value of [0, 1.234, 59.999, 61, 3599.5, 7322.125]) {
++        assert.ok(close(parseTimeInput(formatPreciseTime(value)) as number, Math.round(value * 1000) / 1000), `round trip ${value}`);
++    }
++}
++
++// ---- pinned styles follow their captions -------------------------------------------
++{
++    const pins = [{ start: 0, end: 2, presetId: 'a' }, { start: 5, end: 7, presetId: 'b' }, { start: 10, end: 12, presetId: 'c' }];
++    const styleOf = (list: Subtitle[], overrides: typeof pins) => list.map(c => findPresetOverride(overrides, c) ?? '-');
++    const same = (i: number) => i;
++
++    // Shifting everything later.
++    const old = three();
++    const shifted = shiftCaptions(old, 0, 2).subtitles;
++    assert.deepEqual(styleOf(shifted, remapPresetOverrides(pins, old, shifted, same)), ['a', 'b', 'c']);
++
++    // THE CASE THAT BREAKS NAIVE SHIFTING: shorten a long caption and pull the later
++    // ones in, so the next caption lands inside the long one's old span.
++    const longOld = [cue('a b', 0), cue('c d e f g', 5), cue('h i', 10)].map((c, id) => ({ ...c, id })); // 0-2, 5-10, 10-12
++    const longPins = [{ start: 0, end: 2, presetId: 'a' }, { start: 5, end: 10, presetId: 'b' }, { start: 10, end: 12, presetId: 'c' }];
++    const pulled = setCaptionTiming(longOld, 1, 5, 6, true).subtitles; // the last caption is now 6-8, inside 5-10
++    assert.deepEqual(pulled.map(c => c.start), [0, 5, 6]);
++    assert.deepEqual(styleOf(pulled, remapPresetOverrides(longPins, longOld, pulled, same)), ['a', 'b', 'c']);
++
++    // Retiming one caption across where the next used to start.
++    const stretched = setCaptionTiming(old, 1, 9, 14, true).subtitles;
++    assert.deepEqual(styleOf(stretched, remapPresetOverrides(pins, old, stretched, same)), ['a', 'b', 'c']);
++
++    // Inserting: the new caption has no style; everyone else keeps theirs.
++    const added = insertCaption(old, 1, { text: 'x', start: 2, end: 6 }, true).subtitles;
++    const remapped = remapPresetOverrides(pins, old, added, i => (i < 1 ? i : i + 1));
++    assert.deepEqual(styleOf(added, remapped), ['a', '-', 'b', 'c']);
++
++    // A pin not on any caption is left alone; no pins gives none.
++    const stray = [...pins, { start: 30, end: 31, presetId: 'z' }];
++    assert.ok(remapPresetOverrides(stray, old, shifted, same).some(o => o.presetId === 'z' && o.start === 30));
++    assert.deepEqual(remapPresetOverrides([], old, shifted, same), []);
++}
++
++// ==== Surviving a reformat ===========================================================
++// The app rebuilds what you see from the transcript underneath whenever formatting
++// changes. preserveSubtitleEdits carries edits across; these check timing and
++// inserted captions are carried, and that doing it twice changes nothing more.
++const flatWords = (list: Subtitle[]) => list.flatMap(c => c.words.map(w => [w.word.trim(), Number(w.start), Number(w.end)]));
++
++// A retimed caption keeps its new timing; its neighbours keep theirs.
++{
++    const source = three();
++    const shown = setCaptionTiming(source, 1, 4, 8, false).subtitles;
++    const kept = preserveSubtitleEdits(source, shown);
++    assert.equal(kept.changed, true);
++    assert.deepEqual(kept.segments.map(c => [c.start, c.end, c.text]), [[0, 2, 'a b'], [4, 8, 'c d'], [10, 12, 'e f']]);
++    assert.deepEqual(times(kept.segments[1]), [[4, 6], [6, 8]]);
++    assert.deepEqual(kept.segments[0].words, source[0].words, 'unmoved words are exactly as they were');
++    // Reformatting again finds nothing new.
++    assert.equal(preserveSubtitleEdits(kept.segments, kept.segments).changed, false);
++}
++
++// Shifting everything is kept.
++{
++    const source = three();
++    const kept = preserveSubtitleEdits(source, shiftCaptions(source, 0, 2.5).subtitles);
++    assert.deepEqual(kept.segments.map(c => c.start), [2.5, 7.5, 12.5]);
++    assert.deepEqual(flatWords(kept.segments).map(w => w[0]), ['a', 'b', 'c', 'd', 'e', 'f']);
++}
++
++// Nothing edited: nothing changes, even with tiny rounding differences.
++{
++    const source = three();
++    const rounded = source.map(c => ({ ...c, words: c.words.map(w => ({ ...w, start: w.start + 0.0004 })) }));
++    assert.equal(preserveSubtitleEdits(source, rounded).changed, false);
++}
++
++// An inserted caption becomes a caption of its own, between its neighbours.
++{
++    const source = three();
++    const shown = insertCaption(source, 1, { text: 'hello there', start: 2.5, end: 4.5, speakerId: '1' }, false).subtitles;
++    const kept = preserveSubtitleEdits(source, shown);
++    assert.equal(kept.changed, true);
++    assert.deepEqual(texts(kept.segments), ['a b', 'hello there', 'c d', 'e f']);
++    assert.equal(kept.segments[1].start, 2.5);
++    assert.equal(kept.segments[1].end, 4.5);
++    assert.deepEqual(kept.segments[2].words, source[1].words, 'the caption after it is untouched');
++    // It does not merge into a neighbour with the same speaker, even touching it.
++    const touching = insertCaption(source, 1, { text: 'x y', start: 2, end: 5, speakerId: '1' }, false).subtitles;
++    assert.deepEqual(texts(preserveSubtitleEdits(source, touching).segments), ['a b', 'x y', 'c d', 'e f']);
++    // Done twice, the second time finds nothing new.
++    assert.equal(preserveSubtitleEdits(kept.segments, kept.segments).changed, false);
++}
++
++// First and last.
++{
++    const source = three();
++    const atStart = insertCaption(shiftCaptions(source, 0, 3).subtitles, 0, { text: 'intro', start: 0, end: 2 }, false).subtitles;
++    assert.deepEqual(texts(preserveSubtitleEdits(source, atStart).segments), ['intro', 'a b', 'c d', 'e f']);
++    const atEnd = insertCaption(source, 3, { text: 'outro', start: 13, end: 15 }, false).subtitles;
++    assert.deepEqual(texts(preserveSubtitleEdits(source, atEnd).segments), ['a b', 'c d', 'e f', 'outro']);
++}
++
++// An inserted caption whose text was edited afterwards gets words for its new text.
++{
++    const source = three();
++    const shown = insertCaption(source, 1, { text: 'helo', start: 2.5, end: 4.5 }, false).subtitles;
++    shown[1] = { ...shown[1], text: 'hello there friend' }; // the editor only changes the text
++    const kept = preserveSubtitleEdits(source, shown);
++    assert.deepEqual(kept.segments[1].words.map(w => w.word.trim()), ['hello', 'there', 'friend']);
++    assert.equal(kept.segments[1].words[0].start, 2.5);
++    assert.equal(kept.segments[1].words[2].end, 4.5);
++    // Emptied before a reformat: it is simply dropped.
++    shown[1] = { ...shown[1], text: '   ' };
++    assert.deepEqual(texts(preserveSubtitleEdits(source, shown).segments), ['a b', 'c d', 'e f']);
++}
++
++// Inserting with room made, plus a typo fix elsewhere: all of it is kept.
++{
++    const source = three();
++    let shown = insertCaption(source, 1, { text: 'new', start: 2, end: 6 }, true).subtitles;
++    shown = shown.map((c, i) => (i === 3 ? { ...c, text: 'e F' } : c));
++    const kept = preserveSubtitleEdits(source, shown);
++    assert.deepEqual(texts(kept.segments), ['a b', 'new', 'c d', 'e F']);
++    assert.deepEqual(kept.segments.map(c => c.start), [0, 2, 6, 11]);
++    assert.deepEqual(times(kept.segments[3]), [[11, 12], [12, 13]], 'the fixed caption keeps its moved timing');
++}
++
++// A caption both retimed and corrected keeps both.
++{
++    const source = three();
++    const shown = setCaptionTiming(source, 1, 4, 8, false).subtitles;
++    shown[1] = { ...shown[1], text: 'c D' };
++    const kept = preserveSubtitleEdits(source, shown);
++    assert.equal(kept.segments[1].text, 'c D');
++    assert.deepEqual(times(kept.segments[1]), [[4, 6], [6, 8]]);
++}
++
++// Two inserted captions side by side stay two captions, in order.
++{
++    const source = three();
++    let shown = insertCaption(source, 1, { text: 'one', start: 2, end: 3 }, false).subtitles;
++    shown = insertCaption(shown, 2, { text: 'two', start: 3, end: 5 }, false).subtitles;
++    assert.deepEqual(texts(preserveSubtitleEdits(source, shown).segments), ['a b', 'one', 'two', 'c d', 'e f']);
++}
 diff --git a/AutoSubs-App/scripts/line-styles.test.ts b/AutoSubs-App/scripts/line-styles.test.ts
 new file mode 100644
 index 0000000..a9186bd
@@ -129,7 +453,7 @@ index 7bf2e52..e44ff9d 100644
 +const unlabeledCue = [{ ...cue('no speaker here'), speaker_id: undefined }];
 +assert.equal(preserveSubtitleEdits(unlabeledCue, [{ ...unlabeledCue[0], speaker_id: '' }]).changed, false);
 diff --git a/AutoSubs-App/src-tauri/resources/modules/autosubs_core.lua b/AutoSubs-App/src-tauri/resources/modules/autosubs_core.lua
-index 94070f5..43a8dc2 100644
+index 94070f5..f1b4b48 100644
 --- a/AutoSubs-App/src-tauri/resources/modules/autosubs_core.lua
 +++ b/AutoSubs-App/src-tauri/resources/modules/autosubs_core.lua
 @@ -1403,6 +1403,73 @@ local function get_template(rootFolder, templateName, timeline)
@@ -259,7 +583,7 @@ index 94070f5..43a8dc2 100644
  local function get_speaker_from_id(speakers, id, speakerIndexById)
      local normalizedId = normalize_speaker_id(id)
      if normalizedId == nil then return nil end
-@@ -1533,10 +1646,452 @@ local function get_speaker_from_id(speakers, id, speakerIndexById)
+@@ -1533,10 +1646,519 @@ local function get_speaker_from_id(speakers, id, speakerIndexById)
      return speakers[numericId + 1] or speakers[numericId]
  end
  
@@ -343,7 +667,7 @@ index 94070f5..43a8dc2 100644
 +-- What the title-animation fitting did, in words. Resolve's free edition does
 +-- not show a script's output anywhere the user can read it, so the lines are
 +-- also collected, returned with the result, and shown by the app.
-+local KEYFRAME_FIT_VERSION = "Keyframe fitting v3 (curve rewritten with relative handles, every result checked)"
++local KEYFRAME_FIT_VERSION = "Keyframe fitting v5 (whole frames, ending on the last frame, every result checked)"
 +
 +local function new_fit_log()
 +    return { remaining = 2, contextRemaining = 2, lines = {}, chars = 0 }
@@ -438,11 +762,33 @@ index 94070f5..43a8dc2 100644
 +--   { op = "scale", x }                    every keyframe time is scaled by x
 +-- `templateFrames` is how long the title was authored over; keyframes that run
 +-- past it show it was authored longer, so they win. Returns nil if it cannot be fitted.
++-- A squeeze that keeps keyframes on whole frames: the title's frames 0 to
++-- length-1 map onto the clip's 0 to clipFrames-1, so its last frame lands on the
++-- clip's last frame and never past it. Keyframes stay in order on distinct
++-- frames. Fusion keeps keyframes on whole frames, so a fractional time would not
++-- read back as written. Returns nil when there are more keyframes than frames.
++local function make_scale_plan(times, length, clipFrames)
++    local factor = length > 1 and (clipFrames - 1) / (length - 1) or 1
++    local mapped = {}
++    for i, time in ipairs(times) do
++        mapped[i] = math.floor(time * factor + 0.5)
++        if i > 1 and mapped[i] <= mapped[i - 1] then mapped[i] = mapped[i - 1] + 1 end
++    end
++    for i = #times, 1, -1 do
++        local ceiling = i == #times and clipFrames - 1 or mapped[i + 1] - 1
++        if mapped[i] > ceiling then mapped[i] = ceiling end
++    end
++    if #times > 0 and mapped[1] < 0 then return nil end
++    local map = {}
++    for i, time in ipairs(times) do map[time] = mapped[i] end
++    return { op = "scale", x = factor, map = map }
++end
++
 +local function plan_title_fit(times, templateFrames, clipFrames)
 +    if #times == 0 or not clipFrames or clipFrames < 1 then return nil end
 +    local first, last = times[1], times[#times]
 +    local length = math.max(templateFrames or 0, last + 1)
-+    local factor = clipFrames / length
++    local function squeeze() return make_scale_plan(times, length, clipFrames) end
 +
 +    local gapAt, gapSize = nil, 0
 +    for i = 1, #times - 1 do
@@ -459,7 +805,7 @@ index 94070f5..43a8dc2 100644
 +        if landing >= 0 and landing - lastIntro >= 1 then
 +            return { op = "offset", split = (lastIntro + firstOutro) / 2, x = shift }
 +        end
-+        return { op = "scale", x = factor }
++        return squeeze()
 +    end
 +
 +    -- No clear hold: every keyframe is close together.
@@ -467,15 +813,18 @@ index 94070f5..43a8dc2 100644
 +    if first > 0.5 * length then -- an outro only
 +        if shift == 0 then return { op = "none" } end
 +        if first + shift >= 0 then return { op = "offset", split = first - 0.5, x = shift } end
-+        return { op = "scale", x = factor }
++        return squeeze()
 +    end
-+    return { op = "scale", x = factor } -- runs the whole length: stretch it
++    return squeeze() -- runs the whole length: stretch it
 +end
 +
 +-- Where a keyframe at `time` ends up under a plan.
 +local function planned_time(plan, time)
 +    if plan.op == "offset" and time > plan.split then return time + plan.x end
-+    if plan.op == "scale" then return time * plan.x end
++    if plan.op == "scale" then
++        if plan.map and plan.map[time] ~= nil then return plan.map[time] end
++        return math.floor(time * plan.x + 0.5)
++    end
 +    return time
 +end
 +
@@ -484,27 +833,52 @@ index 94070f5..43a8dc2 100644
 +    return plan.op == "scale" and plan.x or 1
 +end
 +
++-- The curve a plan should produce, keyframe by keyframe.
++--
 +-- A keyframe's handles are stored relative to the keyframe: LH and RH are
 +-- { frames, value } offsets from it (a left handle has negative frames). So
-+-- moving a keyframe in time leaves its handles' numbers exactly as they are, and
-+-- squeezing time scales only their frames. (Fusion's own AdjustKeyFrames is not
-+-- used: it adds the move onto those offsets, which bends the curve.)
-+local function rebuild_with_keyframes(spline, original, plan)
++-- moving a keyframe in time leaves its handles' numbers as they are, and
++-- squeezing time scales their frames. (Fusion's own AdjustKeyFrames is not used:
++-- it adds the move onto those offsets, which bends the curve.)
++--
++-- One exception: when the intro stays and the outro moves, the stretch between
++-- them (the hold) gets shorter or longer, so the two handles that reach into it
++-- are scaled with it. Otherwise, on a short caption, a handle authored to reach
++-- 26 frames across a long hold would reach far past the other end of a 12 frame
++-- one and make the curve double back on itself.
++local function planned_keyframes(original, plan)
++    local times = keyframe_times(original)
 +    local factor = plan_factor(plan)
-+    local rebuilt = {}
-+    for _, time in ipairs(keyframe_times(original)) do
++    local planned = {}
++    for i, time in ipairs(times) do
 +        local keyframe = original[time]
 +        local copy = {}
 +        for key, value in pairs(keyframe) do copy[key] = value end
 +        for _, side in ipairs({ "LH", "RH" }) do
 +            local handle = keyframe[side]
 +            if type(handle) == "table" and type(handle[1]) == "number" then
-+                copy[side] = { handle[1] * factor, handle[2] }
++                local reach = handle[1] * factor
++                if plan.op == "offset" then
++                    local neighbour = side == "RH" and times[i + 1] or (side == "LH" and times[i - 1]) or nil
++                    local straddles = neighbour ~= nil and (
++                        (side == "RH" and time <= plan.split and neighbour > plan.split) or
++                        (side == "LH" and time > plan.split and neighbour <= plan.split))
++                    if straddles then
++                        local span = math.abs(neighbour - time)
++                        local newSpan = span + plan.x
++                        if span > 0 and newSpan < span then reach = reach * math.max(0, newSpan) / span end
++                    end
++                end
++                copy[side] = { reach, handle[2] }
 +            end
 +        end
-+        rebuilt[planned_time(plan, time)] = copy
++        planned[planned_time(plan, time)] = copy
 +    end
-+    return spline:SetKeyFrames(rebuilt, true)
++    return planned
++end
++
++local function rebuild_with_keyframes(spline, original, plan)
++    return spline:SetKeyFrames(planned_keyframes(original, plan), true)
 +end
 +
 +-- A left handle must point back in time and a right handle forward. One that
@@ -526,32 +900,30 @@ index 94070f5..43a8dc2 100644
 +    return crossed
 +end
 +
-+-- Did the curve end up exactly where the plan says? Returns true, or false and why.
++-- Did the curve end up exactly as planned? Returns true, or false and why.
 +local function check_fit(original, now, plan)
-+    local before, after = keyframe_times(original), keyframe_times(now)
-+    if #before ~= #after then return false, "the number of keyframes changed" end
-+    local factor = plan_factor(plan)
-+    for i, time in ipairs(before) do
-+        local was, is = original[time], now[after[i]]
-+        if math.abs(after[i] - planned_time(plan, time)) > 0.01 then
-+            return false, string.format("a keyframe at %.2f went to %.2f instead of %.2f", time, after[i],
-+                planned_time(plan, time))
++    local planned = planned_keyframes(original, plan)
++    local wantTimes, gotTimes = keyframe_times(planned), keyframe_times(now)
++    if #wantTimes ~= #gotTimes then return false, "the number of keyframes changed" end
++    for i, wantTime in ipairs(wantTimes) do
++        local want, got = planned[wantTime], now[gotTimes[i]]
++        if math.abs(gotTimes[i] - wantTime) > 0.01 then
++            return false, string.format("a keyframe went to %.2f instead of %.2f", gotTimes[i], wantTime)
 +        end
-+        if math.abs((tonumber(is[1]) or 0) - (tonumber(was[1]) or 0)) > 1e-4 then
++        if math.abs((tonumber(got[1]) or 0) - (tonumber(want[1]) or 0)) > 1e-4 then
 +            return false, "a keyframe's value changed"
 +        end
 +        for _, side in ipairs({ "LH", "RH" }) do
-+            local handleWas, handleIs = was[side], is[side]
-+            if type(handleWas) == "table" and type(handleWas[1]) == "number" then
-+                if type(handleIs) ~= "table" or type(handleIs[1]) ~= "number" then
++            local handleWant, handleGot = want[side], got[side]
++            if type(handleWant) == "table" and type(handleWant[1]) == "number" then
++                if type(handleGot) ~= "table" or type(handleGot[1]) ~= "number" then
 +                    return false, "a handle was lost"
 +                end
-+                local wanted = handleWas[1] * factor
-+                if math.abs(handleIs[1] - wanted) > 0.01 + 0.01 * math.abs(wanted) then
++                if math.abs(handleGot[1] - handleWant[1]) > 0.01 + 0.01 * math.abs(handleWant[1]) then
 +                    return false, string.format("a %s handle reaches %.2f frames from its keyframe instead of %.2f",
-+                        side, handleIs[1], wanted)
++                        side, handleGot[1], handleWant[1])
 +                end
-+                if math.abs((handleIs[2] or 0) - (handleWas[2] or 0)) > 1e-4 then
++                if math.abs((handleGot[2] or 0) - (handleWant[2] or 0)) > 1e-4 then
 +                    return false, "a handle's height changed"
 +                end
 +            end
@@ -657,16 +1029,35 @@ index 94070f5..43a8dc2 100644
 +    for time in pairs(seen) do allTimes[#allTimes + 1] = time end
 +    table.sort(allTimes)
 +
-+    local clipFrames = math.floor(clipSeconds * rate + 0.5)
++    local captionFrames = math.floor(clipSeconds * rate + 0.5)
++    local clipFrames = captionFrames
++    -- What the placed clip's composition actually spans. The animation has to
++    -- fit that, so when Resolve made the clip a different length from the
++    -- caption (it would not stretch the title, say) the composition wins.
++    local compStart, compEnd = nil, nil
++    pcall(function()
++        local attrs = comp:GetAttrs()
++        if type(attrs) == "table" then
++            compStart, compEnd = tonumber(attrs.COMPN_GlobalStart), tonumber(attrs.COMPN_GlobalEnd)
++        end
++    end)
++    local compFrames = (compStart and compEnd and compEnd >= compStart) and math.floor(compEnd - compStart + 1.5) or nil
++    if compFrames and math.abs(compFrames - captionFrames) > 1 then clipFrames = compFrames end
 +    local templateFrames = templateSeconds and math.floor(templateSeconds * rate + 0.5) or nil
 +    local plan = plan_title_fit(allTimes, templateFrames, clipFrames)
 +
 +    if log and log.contextRemaining and log.contextRemaining > 0 then
 +        log.contextRemaining = log.contextRemaining - 1
++        local compText = compFrames
++            and string.format("composition frames %d to %d", compStart, compEnd)
++            or "composition length not reported"
++        if clipFrames ~= captionFrames then
++            compText = compText .. string.format(", which differs from the caption, so the animation was fitted to %d frames", clipFrames)
++        end
 +        report_line(log, string.format(
-+            "Title length: %s. Caption: %d frames at %.4g fps. Animation curves: %d, keyframes from frame %.2f to %.2f. Plan: %s.",
++            "Title length: %s. Caption: %d frames at %.4g fps (%s). Animation curves: %d, keyframes from frame %.2f to %.2f. Plan: %s.",
 +            templateFrames and string.format("%d frames (reported by Resolve)", templateFrames) or "not reported by Resolve",
-+            clipFrames, rate, #curves, allTimes[1], allTimes[#allTimes],
++            captionFrames, rate, compText, #curves, allTimes[1], allTimes[#allTimes],
 +            plan and describe_plan(plan) or "the clip is too short to hold the animation"))
 +    end
 +    if not plan then
@@ -713,7 +1104,7 @@ index 94070f5..43a8dc2 100644
  end
  
  local function find_subtitle_clips(timeline, transcriptId, subtitles, targetSpeakerId)
-@@ -1641,16 +2196,31 @@ end
+@@ -1641,16 +2263,31 @@ end
  --   skippedBounds      -- count of segments dropped for falling outside the
  --                         timeline (whisper can emit slightly negative starts,
  --                         and transcripts can be longer than the timeline).
@@ -746,7 +1137,7 @@ index 94070f5..43a8dc2 100644
      for i, subtitle in ipairs(subtitles) do
          -- Skip malformed segments (nil start/end) instead of crashing in to_frames().
          if subtitle["start"] == nil or subtitle["end"] == nil then
-@@ -1677,6 +2247,13 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
+@@ -1677,6 +2314,13 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
          local timeline_pos = timelineStart + start_frame
          local clip_timeline_duration = end_frame - start_frame
  
@@ -760,7 +1151,7 @@ index 94070f5..43a8dc2 100644
          -- Clips cannot start before the timeline's first frame.
          if timelineEnd and timeline_pos >= timelineEnd or timeline_pos + clip_timeline_duration <= timelineStart then
              skippedBounds = skippedBounds + 1
-@@ -1698,15 +2275,16 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
+@@ -1698,15 +2342,16 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
              local frames_between = timeline_pos - prevClipEnd
              if frames_between < joinThreshold then
                  prevClip.endFrame = math.max(1, math.floor(
@@ -780,7 +1171,7 @@ index 94070f5..43a8dc2 100644
              mediaType = 1,
              startFrame = 0,
              endFrame = duration,
-@@ -1716,7 +2294,14 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
+@@ -1716,7 +2361,14 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
  
          table.insert(clipList, newClip)
          table.insert(clipSubtitleIndex, i)
@@ -796,7 +1187,7 @@ index 94070f5..43a8dc2 100644
          ::continue::
      end
  
-@@ -1725,7 +2310,7 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
+@@ -1725,7 +2377,7 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
              skippedBounds))
      end
  
@@ -805,7 +1196,7 @@ index 94070f5..43a8dc2 100644
  end
  
  -- Applies subtitle text + styling to each appended timeline item. Instead of
-@@ -1736,8 +2321,10 @@ end
+@@ -1736,8 +2388,10 @@ end
  -- caption_style.apply needs it to tell the bundled macro from a user's own
  -- title before running any helper the comp carries.
  local function apply_subtitle_text(timelineItems, clipCount, subtitles, clipSubtitleIndex, speakers,
@@ -817,7 +1208,7 @@ index 94070f5..43a8dc2 100644
      local failed = 0
      local noFusionComp = 0
      local firstError = nil
-@@ -1771,18 +2358,50 @@ local function apply_subtitle_text(timelineItems, clipCount, subtitles, clipSubt
+@@ -1771,18 +2425,50 @@ local function apply_subtitle_text(timelineItems, clipCount, subtitles, clipSubt
                          speaker = get_speaker_from_id(speakers, subtitle.speaker_id, speakerIndexById)
                      end
  
@@ -872,7 +1263,7 @@ index 94070f5..43a8dc2 100644
  
                      timelineItem:SetClipColor("Green") -- Visualise updated clips
                  end
-@@ -1805,10 +2424,22 @@ local function apply_subtitle_text(timelineItems, clipCount, subtitles, clipSubt
+@@ -1805,10 +2491,22 @@ local function apply_subtitle_text(timelineItems, clipCount, subtitles, clipSubt
              failed, clipCount, tostring(firstError)))
      end
  
@@ -896,7 +1287,7 @@ index 94070f5..43a8dc2 100644
  end
  
  -- Add subtitles to the timeline using the specified template
-@@ -1818,6 +2449,11 @@ end
+@@ -1818,6 +2516,11 @@ end
  function AddSubtitles(req)
      local filePath, trackIndex, templateName = req.filePath, req.trackIndex, req.templateName
      local conflictMode, presetSettings = req.conflictMode, req.presetSettings
@@ -908,7 +1299,7 @@ index 94070f5..43a8dc2 100644
      refresh_project()
      resolve:OpenPage("edit")
  
-@@ -1845,7 +2481,7 @@ function AddSubtitles(req)
+@@ -1845,7 +2548,7 @@ function AddSubtitles(req)
              if not subtitles or #subtitles == 0 then
                  return make_error("Failed to add subtitles", "Transcript has no segments")
              end
@@ -917,7 +1308,7 @@ index 94070f5..43a8dc2 100644
              local transcriptId = get_transcript_id(data, filePath)
  
              local speakersExist = false
-@@ -1877,9 +2513,15 @@ function AddSubtitles(req)
+@@ -1877,9 +2580,15 @@ function AddSubtitles(req)
                  return make_error("Template not found", templateErr)
              end
  
@@ -936,7 +1327,7 @@ index 94070f5..43a8dc2 100644
  
              if #clipList == 0 then
                  local reason = skippedBounds > 0 and
-@@ -2059,9 +2701,15 @@ function AddSubtitles(req)
+@@ -2059,9 +2768,15 @@ function AddSubtitles(req)
              if isAnimated and font_fallback then
                  presetSettings, fontSwap = font_fallback.maybe_override(presetSettings, data["language"])
              end
@@ -953,7 +1344,7 @@ index 94070f5..43a8dc2 100644
              if skippedBounds > 0 then
                  applyStats.failed = applyStats.failed + skippedBounds
                  applyStats.total = applyStats.total + skippedBounds
-@@ -2086,7 +2734,8 @@ function AddSubtitles(req)
+@@ -2086,7 +2801,8 @@ function AddSubtitles(req)
                      total = applyStats.total,
                      noFusionComp = applyStats.noFusionComp,
                      skipped = skippedBounds,
@@ -963,7 +1354,7 @@ index 94070f5..43a8dc2 100644
                  }
              elseif applyStats and applyStats.failed == applyStats.total and applyStats.total > 0 then
                  local short = string.format("Failed to place all %d subtitles", applyStats.total)
-@@ -2099,7 +2748,7 @@ function AddSubtitles(req)
+@@ -2099,7 +2815,7 @@ function AddSubtitles(req)
                  return make_error(short, applyStats.firstError, errCode)
              end
  
@@ -972,7 +1363,7 @@ index 94070f5..43a8dc2 100644
          end)() -- end of inner placement function
      end)
  
-@@ -2113,6 +2762,7 @@ end
+@@ -2113,6 +2829,7 @@ end
  
  function BatchApplyStyle(req)
      local filePath, targetSpeakerId, presetSettings = req.filePath, req.targetSpeakerId, req.presetSettings
@@ -980,7 +1371,7 @@ index 94070f5..43a8dc2 100644
      refresh_project()
  
      local data, loadErr = load_subtitle_data(req)
-@@ -2131,7 +2781,7 @@ function BatchApplyStyle(req)
+@@ -2131,7 +2848,7 @@ function BatchApplyStyle(req)
      end
  
      local speakers = data["speakers"] or {}
@@ -989,7 +1380,7 @@ index 94070f5..43a8dc2 100644
      local transcriptId = get_transcript_id(data, filePath)
      local matches, discovery = find_subtitle_clips(
          timeline,
-@@ -2144,6 +2794,7 @@ function BatchApplyStyle(req)
+@@ -2144,6 +2861,7 @@ function BatchApplyStyle(req)
      if presetSettings ~= nil and next(presetSettings) ~= nil and font_fallback then
          presetSettings, fontSwap = font_fallback.maybe_override(presetSettings, data["language"])
      end
@@ -997,7 +1388,7 @@ index 94070f5..43a8dc2 100644
  
      local updated = 0
      local skipped = 0
-@@ -2154,10 +2805,14 @@ function BatchApplyStyle(req)
+@@ -2154,10 +2872,14 @@ function BatchApplyStyle(req)
          local ok, err = pcall(function()
              local didUpdate = false
  
@@ -1013,7 +1404,7 @@ index 94070f5..43a8dc2 100644
                  if next(clipSettings) ~= nil then
                      caption_style.write(match.comp, match.styleTool, clipSettings)
                      didUpdate = true
-@@ -2203,6 +2858,573 @@ function BatchApplyStyle(req)
+@@ -2203,6 +2925,573 @@ function BatchApplyStyle(req)
      }
  end
  
@@ -1587,7 +1978,7 @@ index 94070f5..43a8dc2 100644
  -- Which video track holds this item. Resolve hands back a fresh proxy on each
  -- call, so fall back to the unique id when identity comparison comes up empty.
  local function track_index_of_item(timeline, target)
-@@ -2805,6 +4027,14 @@ local handlers = {
+@@ -2805,6 +4094,14 @@ local handlers = {
          return { message = "Job completed", result = AddSubtitles(req) }
      end,
  
@@ -2039,16 +2430,417 @@ index 334ac22..a58861e 100644
                  }
                  onClick={handleApplyStyles}
                >
+diff --git a/AutoSubs-App/src/components/subtitles/caption-timing-dialogs.tsx b/AutoSubs-App/src/components/subtitles/caption-timing-dialogs.tsx
+new file mode 100644
+index 0000000..8667aca
+--- /dev/null
++++ b/AutoSubs-App/src/components/subtitles/caption-timing-dialogs.tsx
+@@ -0,0 +1,394 @@
++import * as React from "react";
++import { useTranslation } from "react-i18next";
++
++import { Button } from "@/components/ui/button";
++import { Checkbox } from "@/components/ui/checkbox";
++import {
++    Dialog,
++    DialogContent,
++    DialogDescription,
++    DialogFooter,
++    DialogHeader,
++    DialogTitle,
++} from "@/components/ui/dialog";
++import { Input } from "@/components/ui/input";
++import { Label } from "@/components/ui/label";
++import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
++import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
++import { Textarea } from "@/components/ui/textarea";
++import {
++    formatPreciseTime,
++    parseTimeInput,
++    suggestInsertSlot,
++    type TimingError,
++} from "@/lib/caption-timing";
++import type { Subtitle } from "@/types";
++
++/** A start and end field pair, in m:ss.mmm. */
++function TimeFields({
++    idPrefix,
++    start,
++    end,
++    onStart,
++    onEnd,
++}: {
++    idPrefix: string;
++    start: string;
++    end: string;
++    onStart: (value: string) => void;
++    onEnd: (value: string) => void;
++}) {
++    const { t } = useTranslation();
++    return (
++        <div className="space-y-1.5">
++            <div className="grid grid-cols-2 gap-3">
++                <div className="space-y-1.5">
++                    <Label htmlFor={`${idPrefix}-start`}>{t("subtitles.timingTools.start")}</Label>
++                    <Input
++                        id={`${idPrefix}-start`}
++                        value={start}
++                        inputMode="decimal"
++                        className="font-mono"
++                        onChange={(e) => onStart(e.target.value)}
++                    />
++                </div>
++                <div className="space-y-1.5">
++                    <Label htmlFor={`${idPrefix}-end`}>{t("subtitles.timingTools.end")}</Label>
++                    <Input
++                        id={`${idPrefix}-end`}
++                        value={end}
++                        inputMode="decimal"
++                        className="font-mono"
++                        onChange={(e) => onEnd(e.target.value)}
++                    />
++                </div>
++            </div>
++            <p className="text-xs text-muted-foreground">{t("subtitles.timingTools.timeHint")}</p>
++        </div>
++    );
++}
++
++function ErrorLine({ error }: { error?: TimingError }) {
++    const { t } = useTranslation();
++    if (!error) return null;
++    return (
++        <p role="alert" className="text-sm text-destructive">
++            {t(`subtitles.timingTools.errors.${error}`)}
++        </p>
++    );
++}
++
++function CheckLine({
++    id,
++    checked,
++    onChange,
++    children,
++}: {
++    id: string;
++    checked: boolean;
++    onChange: (checked: boolean) => void;
++    children: React.ReactNode;
++}) {
++    return (
++        <div className="flex items-start gap-2">
++            <Checkbox id={id} checked={checked} onCheckedChange={(value) => onChange(value === true)} className="mt-0.5" />
++            <Label htmlFor={id} className="text-sm font-normal leading-snug">
++                {children}
++            </Label>
++        </div>
++    );
++}
++
++export interface InsertCaptionDialogProps {
++    open: boolean;
++    onOpenChange: (open: boolean) => void;
++    subtitles: Subtitle[];
++    /** The caption the dialog was opened from. */
++    anchorIndex: number;
++    /** Adds the caption; returns why it could not, or nothing when it worked. */
++    onInsert: (
++        position: number,
++        caption: { text: string; start: number; end: number; speakerId?: string },
++        makeRoom: boolean,
++    ) => TimingError | undefined;
++}
++
++/** Add a caption the transcript missed, before or after the selected one. */
++export function InsertCaptionDialog({ open, onOpenChange, subtitles, anchorIndex, onInsert }: InsertCaptionDialogProps) {
++    const { t } = useTranslation();
++    const [side, setSide] = React.useState<"before" | "after">("after");
++    const [text, setText] = React.useState("");
++    const [start, setStart] = React.useState("");
++    const [end, setEnd] = React.useState("");
++    const [makeRoom, setMakeRoom] = React.useState(false);
++    const [error, setError] = React.useState<TimingError | undefined>();
++
++    const position = side === "after" ? anchorIndex + 1 : anchorIndex;
++
++    // Fill in a sensible time whenever the dialog opens or the side changes.
++    React.useEffect(() => {
++        if (!open) return;
++        const slot = suggestInsertSlot(subtitles, position);
++        setStart(formatPreciseTime(slot.start));
++        setEnd(formatPreciseTime(slot.end));
++        setMakeRoom(slot.needsRoom);
++        setError(undefined);
++        // Only on opening or switching side: not while the user types.
++        // eslint-disable-next-line react-hooks/exhaustive-deps
++    }, [open, position]);
++    React.useEffect(() => {
++        if (open) {
++            setText("");
++            setSide("after");
++        }
++    }, [open]);
++
++    const submit = () => {
++        const startSeconds = parseTimeInput(start);
++        const endSeconds = parseTimeInput(end);
++        if (startSeconds === null || endSeconds === null) {
++            setError("invalid");
++            return;
++        }
++        const problem = onInsert(
++            position,
++            { text, start: startSeconds, end: endSeconds, speakerId: subtitles[anchorIndex]?.speaker_id },
++            makeRoom,
++        );
++        if (problem) {
++            setError(problem);
++            return;
++        }
++        onOpenChange(false);
++    };
++
++    return (
++        <Dialog open={open} onOpenChange={onOpenChange}>
++            <DialogContent className="sm:max-w-md" onClick={(e) => e.stopPropagation()}>
++                <DialogHeader>
++                    <DialogTitle>{t("subtitles.timingTools.insert.title")}</DialogTitle>
++                    <DialogDescription>{t("subtitles.timingTools.insert.description")}</DialogDescription>
++                </DialogHeader>
++                <form
++                    className="space-y-4"
++                    onSubmit={(e) => {
++                        e.preventDefault();
++                        submit();
++                    }}
++                >
++                    <div className="space-y-1.5">
++                        <Label>{t("subtitles.timingTools.insert.position")}</Label>
++                        <Select value={side} onValueChange={(value) => setSide(value as "before" | "after")}>
++                            <SelectTrigger>
++                                <SelectValue />
++                            </SelectTrigger>
++                            <SelectContent>
++                                <SelectItem value="after">{t("subtitles.timingTools.insert.after")}</SelectItem>
++                                <SelectItem value="before">{t("subtitles.timingTools.insert.before")}</SelectItem>
++                            </SelectContent>
++                        </Select>
++                    </div>
++                    <div className="space-y-1.5">
++                        <Label htmlFor="insert-caption-text">{t("subtitles.timingTools.insert.text")}</Label>
++                        <Textarea
++                            id="insert-caption-text"
++                            value={text}
++                            autoFocus
++                            rows={2}
++                            placeholder={t("subtitles.timingTools.insert.textPlaceholder")}
++                            onChange={(e) => setText(e.target.value)}
++                            onKeyDown={(e) => {
++                                if (e.key === "Enter" && !e.shiftKey) {
++                                    e.preventDefault();
++                                    submit();
++                                }
++                            }}
++                        />
++                    </div>
++                    <TimeFields idPrefix="insert-caption" start={start} end={end} onStart={setStart} onEnd={setEnd} />
++                    <CheckLine id="insert-caption-make-room" checked={makeRoom} onChange={setMakeRoom}>
++                        {t("subtitles.timingTools.insert.makeRoom")}
++                    </CheckLine>
++                    <ErrorLine error={error} />
++                    <DialogFooter>
++                        <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
++                            {t("subtitles.timingTools.cancel")}
++                        </Button>
++                        <Button type="submit">{t("subtitles.timingTools.insert.submit")}</Button>
++                    </DialogFooter>
++                </form>
++            </DialogContent>
++        </Dialog>
++    );
++}
++
++export interface ShiftOutcome {
++    error?: TimingError;
++    appliedOffset: number;
++    clamped: boolean;
++    count: number;
++}
++
++export interface CaptionTimingDialogProps {
++    open: boolean;
++    onOpenChange: (open: boolean) => void;
++    subtitles: Subtitle[];
++    index: number;
++    /** Retimes the caption; returns why it could not, or nothing when it worked. */
++    onSetTiming: (start: number, end: number, moveLater: boolean) => TimingError | undefined;
++    /** Moves captions from `fromIndex` on by `offset` seconds. */
++    onShift: (fromIndex: number, offset: number) => ShiftOutcome;
++}
++
++/** Change one caption's start and end, or move many captions at once. */
++export function CaptionTimingDialog({ open, onOpenChange, subtitles, index, onSetTiming, onShift }: CaptionTimingDialogProps) {
++    const { t } = useTranslation();
++    const cue = subtitles[index];
++    const [tab, setTab] = React.useState("caption");
++    const [start, setStart] = React.useState("");
++    const [end, setEnd] = React.useState("");
++    const [moveLater, setMoveLater] = React.useState(false);
++    const [amount, setAmount] = React.useState("");
++    const [scope, setScope] = React.useState<"all" | "from">("all");
++    const [error, setError] = React.useState<TimingError | undefined>();
++    const [shiftNote, setShiftNote] = React.useState<string | undefined>();
++
++    React.useEffect(() => {
++        if (!open || !cue) return;
++        setStart(formatPreciseTime(Number(cue.start)));
++        setEnd(formatPreciseTime(Number(cue.end)));
++        setMoveLater(false);
++        setAmount("");
++        setError(undefined);
++        setShiftNote(undefined);
++        // Only on opening: not while the user types.
++        // eslint-disable-next-line react-hooks/exhaustive-deps
++    }, [open, index]);
++
++    const applyCaption = () => {
++        const startSeconds = parseTimeInput(start);
++        const endSeconds = parseTimeInput(end);
++        if (startSeconds === null || endSeconds === null) {
++            setError("invalid");
++            return;
++        }
++        const problem = onSetTiming(startSeconds, endSeconds, moveLater);
++        if (problem) {
++            setError(problem);
++            return;
++        }
++        onOpenChange(false);
++    };
++
++    const applyShift = () => {
++        const offset = parseTimeInput(amount, true);
++        if (offset === null) {
++            setError("invalid");
++            return;
++        }
++        const outcome = onShift(scope === "all" ? 0 : index, offset);
++        if (outcome.error) {
++            setError(outcome.error);
++            return;
++        }
++        if (outcome.appliedOffset === 0) {
++            // Nothing could move (already at the start, or butting up against
++            // the caption before): say so instead of closing silently.
++            setError(undefined);
++            setShiftNote(t("subtitles.timingTools.timing.nothingToShift"));
++            return;
++        }
++        onOpenChange(false);
++    };
++
++    if (!cue) return null;
++
++    return (
++        <Dialog open={open} onOpenChange={onOpenChange}>
++            <DialogContent className="sm:max-w-md" onClick={(e) => e.stopPropagation()}>
++                <DialogHeader>
++                    <DialogTitle>{t("subtitles.timingTools.timing.title")}</DialogTitle>
++                    <DialogDescription className="line-clamp-2">{cue.text}</DialogDescription>
++                </DialogHeader>
++                <Tabs
++                    value={tab}
++                    onValueChange={(value) => {
++                        setTab(value);
++                        setError(undefined);
++                        setShiftNote(undefined);
++                    }}
++                >
++                    <TabsList className="grid w-full grid-cols-2">
++                        <TabsTrigger value="caption">{t("subtitles.timingTools.timing.tabCaption")}</TabsTrigger>
++                        <TabsTrigger value="shift">{t("subtitles.timingTools.timing.tabShift")}</TabsTrigger>
++                    </TabsList>
++
++                    <TabsContent value="caption">
++                        <form
++                            className="space-y-4 pt-2"
++                            onSubmit={(e) => {
++                                e.preventDefault();
++                                applyCaption();
++                            }}
++                        >
++                            <TimeFields idPrefix="caption-timing" start={start} end={end} onStart={setStart} onEnd={setEnd} />
++                            <CheckLine id="caption-timing-move-later" checked={moveLater} onChange={setMoveLater}>
++                                {t("subtitles.timingTools.timing.moveLater")}
++                            </CheckLine>
++                            <ErrorLine error={error} />
++                            <DialogFooter>
++                                <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
++                                    {t("subtitles.timingTools.cancel")}
++                                </Button>
++                                <Button type="submit">{t("subtitles.timingTools.timing.apply")}</Button>
++                            </DialogFooter>
++                        </form>
++                    </TabsContent>
++
++                    <TabsContent value="shift">
++                        <form
++                            className="space-y-4 pt-2"
++                            onSubmit={(e) => {
++                                e.preventDefault();
++                                applyShift();
++                            }}
++                        >
++                            <div className="space-y-1.5">
++                                <Label htmlFor="caption-shift-amount">{t("subtitles.timingTools.timing.amount")}</Label>
++                                <Input
++                                    id="caption-shift-amount"
++                                    value={amount}
++                                    inputMode="decimal"
++                                    placeholder="+0.500"
++                                    className="font-mono"
++                                    onChange={(e) => setAmount(e.target.value)}
++                                />
++                                <p className="text-xs text-muted-foreground">{t("subtitles.timingTools.timing.amountHint")}</p>
++                            </div>
++                            <div className="space-y-1.5">
++                                <Label>{t("subtitles.timingTools.timing.scope")}</Label>
++                                <Select value={scope} onValueChange={(value) => setScope(value as "all" | "from")}>
++                                    <SelectTrigger>
++                                        <SelectValue />
++                                    </SelectTrigger>
++                                    <SelectContent>
++                                        <SelectItem value="all">{t("subtitles.timingTools.timing.scopeAll")}</SelectItem>
++                                        <SelectItem value="from">{t("subtitles.timingTools.timing.scopeFrom")}</SelectItem>
++                                    </SelectContent>
++                                </Select>
++                            </div>
++                            <ErrorLine error={error} />
++                            {shiftNote ? <p className="text-sm text-muted-foreground">{shiftNote}</p> : null}
++                            <DialogFooter>
++                                <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
++                                    {t("subtitles.timingTools.cancel")}
++                                </Button>
++                                <Button type="submit">{t("subtitles.timingTools.timing.shiftSubmit")}</Button>
++                            </DialogFooter>
++                        </form>
++                    </TabsContent>
++                </Tabs>
++            </DialogContent>
++        </Dialog>
++    );
++}
 diff --git a/AutoSubs-App/src/components/subtitles/subtitle-list.tsx b/AutoSubs-App/src/components/subtitles/subtitle-list.tsx
-index 438f4ee..dcc9e01 100644
+index 438f4ee..2bf1779 100644
 --- a/AutoSubs-App/src/components/subtitles/subtitle-list.tsx
 +++ b/AutoSubs-App/src/components/subtitles/subtitle-list.tsx
-@@ -4,16 +4,23 @@ import { useVirtualizer } from "@tanstack/react-virtual";
+@@ -4,16 +4,26 @@ import { useVirtualizer } from "@tanstack/react-virtual";
  import { useSubtitleDocument } from "@/contexts/SubtitleDocumentContext"
  import { Button } from "@/components/ui/button"
  import { ButtonGroup } from "@/components/ui/button-group"
 -import { ArrowDown, ArrowUp, X } from "lucide-react"
-+import { ArrowDown, ArrowUp, Settings2, X } from "lucide-react"
++import { ArrowDown, ArrowUp, Clock, ListPlus, Settings2, X } from "lucide-react"
++import { toast } from "sonner"
  import { useTranslation } from "react-i18next"
  import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
  import { SpeakerSettings } from "@/components/common/speaker-settings"
@@ -2058,7 +2850,9 @@ index 438f4ee..dcc9e01 100644
 +import { useIntegration } from "@/contexts/IntegrationContext"
 +import { useResolve } from "@/contexts/ResolveContext"
 +import { isAutoSubsTemplate } from "@/lib/caption-style"
-+import { findPresetOverride, parseTitleStyle, setPresetOverride, titleStyleValue } from "@/lib/line-styles"
++import { findPresetOverride, parseTitleStyle, remapPresetOverrides, setPresetOverride, titleStyleValue } from "@/lib/line-styles"
++import { insertCaption, setCaptionTiming, shiftCaptions, type TimingError } from "@/lib/caption-timing"
++import { CaptionTimingDialog, InsertCaptionDialog, type ShiftOutcome } from "@/components/subtitles/caption-timing-dialogs"
  import { moveEdgeWord, type WordMoveDirection } from "@/utils/word-move"
  
  const ESTIMATED_SUBTITLE_ROW_HEIGHT = 96;
@@ -2068,7 +2862,7 @@ index 438f4ee..dcc9e01 100644
  
  interface SubtitleListProps {
      searchQuery?: string;
-@@ -45,7 +52,43 @@ const SubtitleList = ({
+@@ -45,7 +55,43 @@ const SubtitleList = ({
  }: SubtitleListProps) => {
      const { t } = useTranslation();
      const shortcutModifier = navigator.platform.startsWith("Mac") ? "⌘" : "Ctrl";
@@ -2113,7 +2907,19 @@ index 438f4ee..dcc9e01 100644
      const [uncontrolledSelectedIndex, setUncontrolledSelectedIndex] = useState<number | null>(null);
      const selectedIndex = controlledSelectedIndex ?? uncontrolledSelectedIndex;
  
-@@ -92,15 +135,8 @@ const SubtitleList = ({
+@@ -56,6 +102,11 @@ const SubtitleList = ({
+     const lastSubtitlesPropRef = useRef(subtitles);
+     const moveHistoryRef = useRef<{ past: (typeof subtitles)[]; future: (typeof subtitles)[] }>({ past: [], future: [] });
+     const [editingSubtitleId, setEditingSubtitleId] = React.useState<number | null>(null);
++    // Which timing dialog is open, and for which caption. The dialogs keep the
++    // index themselves because using them clears the list's selection.
++    const [timingDialog, setTimingDialog] = useState<{ kind: "insert" | "timing"; index: number } | null>(null);
++    const timingDialogOpenRef = useRef(false);
++    timingDialogOpenRef.current = timingDialog !== null;
+ 
+     const containerRef = useRef<HTMLDivElement>(null);
+ 
+@@ -92,15 +143,8 @@ const SubtitleList = ({
      }, [searchCaseSensitive, searchWholeWord]);
  
      // speaker_id can be either 0-based ("0", "1", ...) or 1-based ("1", "2", ...).
@@ -2131,7 +2937,7 @@ index 438f4ee..dcc9e01 100644
  
      const getSpeakerIndex = useCallback((speakerId: string | undefined) => {
          if (!speakerId) return 0;
-@@ -116,6 +152,13 @@ const SubtitleList = ({
+@@ -116,6 +160,13 @@ const SubtitleList = ({
          return 0;
      }, [speakerIdBase, speakers.length]);
  
@@ -2145,10 +2951,74 @@ index 438f4ee..dcc9e01 100644
      const filteredSubtitleItems = useMemo(() => {
          const query = searchQuery ?? "";
          return subtitles
-@@ -289,6 +332,52 @@ const SubtitleList = ({
+@@ -155,6 +206,8 @@ const SubtitleList = ({
+     // Handle click outside to deselect subtitle
+     useEffect(() => {
+         const handleClickOutside = (event: MouseEvent) => {
++            // Working in a timing dialog is not leaving the caption.
++            if (timingDialogOpenRef.current) return;
+             // Check if the click is outside the subtitle list container
+             if (containerRef.current && !containerRef.current.contains(event.target as Node)) {
+                 setSelectedIndex(null);
+@@ -289,6 +342,107 @@ const SubtitleList = ({
  
      const handleMoveLastWordToNext = (index: number) => moveWord(index, "next");
  
++    // Show captions that were retimed or added, keep each pinned style with its
++    // caption, and select `focusIndex`. `newIndexOf` maps each caption's old
++    // position to its new one.
++    const commitTimingEdit = (
++        next: typeof subtitles,
++        newIndexOf: (oldIndex: number) => number,
++        focusIndex: number,
++    ) => {
++        const before = subtitlesRef.current;
++        // The word-move history holds the old timing; undoing into it would
++        // separate captions from their pinned styles.
++        moveHistoryRef.current = { past: [], future: [] };
++        showSubtitles(next, focusIndex);
++        if (presetOverrides.length) {
++            // After queuing the captions: this flushes them to disk first, so the
++            // two writes to the document cannot cross.
++            updatePresetOverrides(remapPresetOverrides(presetOverrides, before, next, newIndexOf));
++        }
++    };
++
++    const handleInsertCaption = (
++        position: number,
++        caption: { text: string; start: number; end: number; speakerId?: string },
++        makeRoom: boolean,
++    ): TimingError | undefined => {
++        const result = insertCaption(subtitlesRef.current, position, caption, makeRoom);
++        if (result.error) return result.error;
++        commitTimingEdit(result.subtitles, (i) => (i < result.index ? i : i + 1), result.index);
++        return undefined;
++    };
++
++    const handleSetTiming = (index: number, start: number, end: number, moveLater: boolean): TimingError | undefined => {
++        const result = setCaptionTiming(subtitlesRef.current, index, start, end, moveLater);
++        if (result.error) return result.error;
++        commitTimingEdit(result.subtitles, (i) => i, index);
++        return undefined;
++    };
++
++    const handleShiftCaptions = (fromIndex: number, offset: number, focusIndex: number): ShiftOutcome => {
++        const before = subtitlesRef.current;
++        const result = shiftCaptions(before, fromIndex, offset);
++        const count = Math.max(0, before.length - fromIndex);
++        if (result.error || result.appliedOffset === 0) {
++            return { error: result.error, appliedOffset: 0, clamped: result.clamped, count };
++        }
++        commitTimingEdit(result.subtitles, (i) => i, focusIndex);
++        const amount = `${result.appliedOffset > 0 ? "+" : ""}${result.appliedOffset.toFixed(3)}`;
++        if (result.clamped) {
++            toast.info(t("subtitles.timingTools.timing.clamped", { count, amount }));
++        } else {
++            toast.success(t("subtitles.timingTools.timing.shifted", { count, amount }));
++        }
++        return { appliedOffset: result.appliedOffset, clamped: result.clamped, count };
++    };
++
 +    // Reassign one cue to another speaker. The cue keeps its text and timing; its
 +    // styling and output track follow the speaker it now belongs to.
 +    const handleSpeakerReassign = (index: number, speakerIndex: number) => {
@@ -2198,7 +3068,7 @@ index 438f4ee..dcc9e01 100644
      const renderHighlightedText = (text: string, query: string) => {
          if (!query.trim() || !text) return text;
  
-@@ -360,10 +449,82 @@ const SubtitleList = ({
+@@ -360,10 +514,82 @@ const SubtitleList = ({
                                          >
                                              {formatTimecode(subtitle.start)}
                                          </button>
@@ -2284,7 +3154,7 @@ index 438f4ee..dcc9e01 100644
                                                      onOpenChange={(open) => {
                                                          if (!open) {
                                                              setEditingSubtitleId(null);
-@@ -372,14 +533,19 @@ const SubtitleList = ({
+@@ -372,14 +598,19 @@ const SubtitleList = ({
                                                  >
                                                      <PopoverTrigger asChild>
                                                          <Button
@@ -2311,7 +3181,7 @@ index 438f4ee..dcc9e01 100644
                                                          </Button>
                                                      </PopoverTrigger>
                                                      <PopoverContent align="end" className="relative bg-card" onClick={(e) => e.stopPropagation()}>
-@@ -413,21 +579,7 @@ const SubtitleList = ({
+@@ -413,21 +644,7 @@ const SubtitleList = ({
                                                          </div>
                                                      </PopoverContent>
                                                  </Popover>
@@ -2334,6 +3204,60 @@ index 438f4ee..dcc9e01 100644
                                          ) : null}
  
                                      </div>
+@@ -553,10 +770,53 @@ const SubtitleList = ({
+                                             </Tooltip>
+                                         </ButtonGroup>
+                                         ) : null}
++                                        {isSelected ? (
++                                        <ButtonGroup className="mt-2">
++                                            <Button
++                                                variant="outline"
++                                                className="text-xs h-8"
++                                                onMouseDown={(e) => e.preventDefault()}
++                                                onClick={(e) => {
++                                                    e.stopPropagation();
++                                                    setTimingDialog({ kind: "insert", index });
++                                                }}
++                                            >
++                                                <ListPlus />
++                                                {t("subtitles.timingTools.insert.button")}
++                                            </Button>
++                                            <Button
++                                                variant="outline"
++                                                className="text-xs h-8"
++                                                onMouseDown={(e) => e.preventDefault()}
++                                                onClick={(e) => {
++                                                    e.stopPropagation();
++                                                    setTimingDialog({ kind: "timing", index });
++                                                }}
++                                            >
++                                                <Clock />
++                                                {t("subtitles.timingTools.timing.button")}
++                                            </Button>
++                                        </ButtonGroup>
++                                        ) : null}
+                                     </div>
+                                 </div>
+                             );
+                         })}
++            <InsertCaptionDialog
++                open={timingDialog?.kind === "insert"}
++                onOpenChange={(open) => { if (!open) setTimingDialog(null); }}
++                subtitles={subtitles}
++                anchorIndex={timingDialog?.index ?? 0}
++                onInsert={handleInsertCaption}
++            />
++            <CaptionTimingDialog
++                open={timingDialog?.kind === "timing"}
++                onOpenChange={(open) => { if (!open) setTimingDialog(null); }}
++                subtitles={subtitles}
++                index={timingDialog?.index ?? 0}
++                onSetTiming={(start, end, moveLater) => handleSetTiming(timingDialog?.index ?? 0, start, end, moveLater)}
++                onShift={(fromIndex, offset) => handleShiftCaptions(fromIndex, offset, timingDialog?.index ?? 0)}
++            />
+         </div>
+     )
+ }
 diff --git a/AutoSubs-App/src/components/subtitles/subtitle-viewer-panel.tsx b/AutoSubs-App/src/components/subtitles/subtitle-viewer-panel.tsx
 index 489e28e..a26c361 100644
 --- a/AutoSubs-App/src/components/subtitles/subtitle-viewer-panel.tsx
@@ -2605,7 +3529,7 @@ index b810376..b32bdbb 100644
        flushPendingSubtitleSave,
        processTranscriptionResults,
 diff --git a/AutoSubs-App/src/i18n/locales/de/translation.json b/AutoSubs-App/src/i18n/locales/de/translation.json
-index 179e8a2..e38c230 100644
+index 179e8a2..32bfc85 100644
 --- a/AutoSubs-App/src/i18n/locales/de/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/de/translation.json
 @@ -487,6 +487,12 @@
@@ -2621,7 +3545,57 @@ index 179e8a2..e38c230 100644
      "previousSubtitles": "Untertitelverlauf",
      "empty": {
        "noSubtitlesAvailable": "Deine Untertitel werden hier angezeigt, sobald die Transkription abgeschlossen ist"
-@@ -637,6 +643,41 @@
+@@ -502,6 +508,49 @@
+       "lastWord": "Letztes Wort",
+       "toPrevious": "Erstes Wort nach oben ({{shortcut}})",
+       "toNext": "Letztes Wort nach unten ({{shortcut}})"
++    },
++    "timingTools": {
++      "start": "Start",
++      "end": "Ende",
++      "cancel": "Abbrechen",
++      "timeHint": "Minuten:Sekunden.Millisekunden, z. B. 1:02.500. Reine Sekunden gehen auch.",
++      "insert": {
++        "button": "Untertitel einfügen",
++        "title": "Untertitel einfügen",
++        "description": "Füge einen Untertitel hinzu, den das Transkript ausgelassen hat. Er wird über den angegebenen Zeitraum verteilt.",
++        "position": "Wo",
++        "after": "Nach diesem Untertitel",
++        "before": "Vor diesem Untertitel",
++        "text": "Text",
++        "textPlaceholder": "Was soll dort stehen?",
++        "makeRoom": "Die folgenden Untertitel nach hinten verschieben, um Platz zu schaffen",
++        "submit": "Einfügen"
++      },
++      "timing": {
++        "button": "Timing",
++        "title": "Untertitel-Timing",
++        "tabCaption": "Dieser Untertitel",
++        "tabShift": "Untertitel verschieben",
++        "moveLater": "Die folgenden Untertitel um denselben Betrag verschieben",
++        "apply": "Übernehmen",
++        "amount": "Verschieben um (Sekunden)",
++        "amountHint": "Mit Minuszeichen nach vorne verschieben, z. B. -0.5.",
++        "scope": "Welche Untertitel",
++        "scopeAll": "Alle Untertitel",
++        "scopeFrom": "Dieser Untertitel und alle danach",
++        "shiftSubmit": "Verschieben",
++        "shifted": "{{count}} Untertitel um {{amount}} s verschoben",
++        "clamped": "{{count}} Untertitel um {{amount}} s verschoben, so weit es ohne Überlappung ging",
++        "nothingToShift": "Diese Untertitel können nicht weiter nach vorne: Sie beginnen bereits direkt nach dem vorherigen Untertitel oder bei 0."
++      },
++      "errors": {
++        "invalid": "Das ist keine Zeit. Verwende Minuten:Sekunden.Millisekunden, z. B. 1:02.500.",
++        "beforeStart": "Zeiten können nicht vor 0 liegen.",
++        "tooShort": "Das Ende muss mindestens 0,1 Sekunden nach dem Start liegen.",
++        "overlapsPrevious": "Er würde den vorherigen Untertitel überlappen.",
++        "overlapsNext": "Er würde den nächsten Untertitel überlappen. Kürze ihn oder setze das Häkchen, um die folgenden Untertitel zu verschieben.",
++        "emptyText": "Gib ein, was der Untertitel sagen soll."
++      }
+     }
+   },
+   "gettingStarted": {
+@@ -637,6 +686,41 @@
        "partial": "{{updated}} aktualisiert, {{failed}} fehlgeschlagen",
        "failed": "Timeline-Stile konnten nicht geändert werden"
      },
@@ -2664,7 +3638,7 @@ index 179e8a2..e38c230 100644
        "adding": "Wird gesendet...",
        "placedPartial": "{{placed}} von {{total}} Untertiteln platziert",
 diff --git a/AutoSubs-App/src/i18n/locales/en/translation.json b/AutoSubs-App/src/i18n/locales/en/translation.json
-index f59edad..5f55ba5 100644
+index f59edad..65cdfb3 100644
 --- a/AutoSubs-App/src/i18n/locales/en/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/en/translation.json
 @@ -507,6 +507,12 @@
@@ -2680,7 +3654,57 @@ index f59edad..5f55ba5 100644
      "previousSubtitles": "Subtitle History",
      "empty": {
        "noSubtitlesAvailable": "Your subtitles will appear here when finished transcribing"
-@@ -657,6 +663,41 @@
+@@ -522,6 +528,49 @@
+       "lastWord": "Last word",
+       "toPrevious": "Move first word up ({{shortcut}})",
+       "toNext": "Move last word down ({{shortcut}})"
++    },
++    "timingTools": {
++      "start": "Start",
++      "end": "End",
++      "cancel": "Cancel",
++      "timeHint": "Minutes:seconds.milliseconds, like 1:02.500. Plain seconds work too.",
++      "insert": {
++        "button": "Insert caption",
++        "title": "Insert a caption",
++        "description": "Add a caption the transcript missed. It is timed across the span you give it.",
++        "position": "Where",
++        "after": "After this caption",
++        "before": "Before this caption",
++        "text": "Text",
++        "textPlaceholder": "What should it say?",
++        "makeRoom": "Move the captions after it later to make room",
++        "submit": "Insert"
++      },
++      "timing": {
++        "button": "Timing",
++        "title": "Caption timing",
++        "tabCaption": "This caption",
++        "tabShift": "Shift captions",
++        "moveLater": "Move the captions after it by the same amount",
++        "apply": "Apply",
++        "amount": "Move by (seconds)",
++        "amountHint": "Use a minus sign to move earlier, like -0.5.",
++        "scope": "Which captions",
++        "scopeAll": "All captions",
++        "scopeFrom": "This caption and everything after it",
++        "shiftSubmit": "Shift",
++        "shifted": "Moved {{count}} captions by {{amount}} s",
++        "clamped": "Moved {{count}} captions by {{amount}} s, as far as they could go without overlapping",
++        "nothingToShift": "Those captions can't move any earlier: they already start right after the caption before them, or at 0."
++      },
++      "errors": {
++        "invalid": "That isn't a time. Use minutes:seconds.milliseconds, like 1:02.500.",
++        "beforeStart": "Times can't be before 0.",
++        "tooShort": "The end must be at least 0.1 seconds after the start.",
++        "overlapsPrevious": "It would overlap the caption before it.",
++        "overlapsNext": "It would overlap the caption after it. Shorten it, or tick the box to move the later captions.",
++        "emptyText": "Type what the caption should say."
++      }
+     }
+   },
+   "gettingStarted": {
+@@ -657,6 +706,41 @@
        "partial": "Updated {{updated}} clips, {{failed}} failed",
        "failed": "Couldn't update timeline styles"
      },
@@ -2723,7 +3747,7 @@ index f59edad..5f55ba5 100644
        "adding": "Sending...",
        "placedPartial": "Placed {{placed}} of {{total}} subtitles",
 diff --git a/AutoSubs-App/src/i18n/locales/es/translation.json b/AutoSubs-App/src/i18n/locales/es/translation.json
-index 8db6c5d..c263282 100644
+index 8db6c5d..c8b13da 100644
 --- a/AutoSubs-App/src/i18n/locales/es/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/es/translation.json
 @@ -487,6 +487,12 @@
@@ -2739,7 +3763,57 @@ index 8db6c5d..c263282 100644
      "previousSubtitles": "Historial de subtítulos",
      "empty": {
        "noSubtitlesAvailable": "Tus subtítulos aparecerán aquí cuando termine la transcripción"
-@@ -637,6 +643,41 @@
+@@ -502,6 +508,49 @@
+       "lastWord": "Última palabra",
+       "toPrevious": "Subir primera palabra ({{shortcut}})",
+       "toNext": "Bajar última palabra ({{shortcut}})"
++    },
++    "timingTools": {
++      "start": "Inicio",
++      "end": "Fin",
++      "cancel": "Cancelar",
++      "timeHint": "Minutos:segundos.milisegundos, como 1:02.500. También sirven los segundos solos.",
++      "insert": {
++        "button": "Insertar subtítulo",
++        "title": "Insertar un subtítulo",
++        "description": "Añade un subtítulo que la transcripción omitió. Se distribuye a lo largo del intervalo que indiques.",
++        "position": "Dónde",
++        "after": "Después de este subtítulo",
++        "before": "Antes de este subtítulo",
++        "text": "Texto",
++        "textPlaceholder": "¿Qué debe decir?",
++        "makeRoom": "Retrasar los subtítulos siguientes para hacer sitio",
++        "submit": "Insertar"
++      },
++      "timing": {
++        "button": "Tiempos",
++        "title": "Tiempos del subtítulo",
++        "tabCaption": "Este subtítulo",
++        "tabShift": "Desplazar subtítulos",
++        "moveLater": "Mover los subtítulos siguientes la misma cantidad",
++        "apply": "Aplicar",
++        "amount": "Mover (segundos)",
++        "amountHint": "Usa un signo menos para adelantar, como -0.5.",
++        "scope": "Qué subtítulos",
++        "scopeAll": "Todos los subtítulos",
++        "scopeFrom": "Este subtítulo y todos los siguientes",
++        "shiftSubmit": "Desplazar",
++        "shifted": "{{count}} subtítulos movidos {{amount}} s",
++        "clamped": "{{count}} subtítulos movidos {{amount}} s, hasta donde se pudo sin solaparse",
++        "nothingToShift": "Esos subtítulos no pueden adelantarse más: ya empiezan justo después del anterior, o en 0."
++      },
++      "errors": {
++        "invalid": "Eso no es un tiempo. Usa minutos:segundos.milisegundos, como 1:02.500.",
++        "beforeStart": "Los tiempos no pueden ser anteriores a 0.",
++        "tooShort": "El fin debe estar al menos 0,1 segundos después del inicio.",
++        "overlapsPrevious": "Se solaparía con el subtítulo anterior.",
++        "overlapsNext": "Se solaparía con el subtítulo siguiente. Acórtalo o marca la casilla para mover los siguientes.",
++        "emptyText": "Escribe lo que debe decir el subtítulo."
++      }
+     }
+   },
+   "gettingStarted": {
+@@ -637,6 +686,41 @@
        "partial": "{{updated}} actualizados, {{failed}} con error",
        "failed": "No se pudieron actualizar los estilos"
      },
@@ -2782,7 +3856,7 @@ index 8db6c5d..c263282 100644
        "adding": "Enviando...",
        "placedPartial": "Colocados {{placed}} de {{total}} subtítulos",
 diff --git a/AutoSubs-App/src/i18n/locales/fr/translation.json b/AutoSubs-App/src/i18n/locales/fr/translation.json
-index eaf79f0..4da3588 100644
+index eaf79f0..9c7ab6e 100644
 --- a/AutoSubs-App/src/i18n/locales/fr/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/fr/translation.json
 @@ -487,6 +487,12 @@
@@ -2798,7 +3872,57 @@ index eaf79f0..4da3588 100644
      "previousSubtitles": "Historique des sous-titres",
      "empty": {
        "noSubtitlesAvailable": "Vos sous-titres apparaîtront ici une fois la transcription terminée"
-@@ -637,6 +643,41 @@
+@@ -502,6 +508,49 @@
+       "lastWord": "Dernier mot",
+       "toPrevious": "Monter le premier mot ({{shortcut}})",
+       "toNext": "Descendre le dernier mot ({{shortcut}})"
++    },
++    "timingTools": {
++      "start": "Début",
++      "end": "Fin",
++      "cancel": "Annuler",
++      "timeHint": "Minutes:secondes.millisecondes, par ex. 1:02.500. Les secondes seules fonctionnent aussi.",
++      "insert": {
++        "button": "Insérer un sous-titre",
++        "title": "Insérer un sous-titre",
++        "description": "Ajoutez un sous-titre oublié par la transcription. Il est réparti sur l'intervalle indiqué.",
++        "position": "Où",
++        "after": "Après ce sous-titre",
++        "before": "Avant ce sous-titre",
++        "text": "Texte",
++        "textPlaceholder": "Que doit-il dire ?",
++        "makeRoom": "Décaler les sous-titres suivants pour faire de la place",
++        "submit": "Insérer"
++      },
++      "timing": {
++        "button": "Minutage",
++        "title": "Minutage du sous-titre",
++        "tabCaption": "Ce sous-titre",
++        "tabShift": "Décaler les sous-titres",
++        "moveLater": "Décaler les sous-titres suivants d'autant",
++        "apply": "Appliquer",
++        "amount": "Décaler de (secondes)",
++        "amountHint": "Utilisez un signe moins pour avancer, par ex. -0.5.",
++        "scope": "Quels sous-titres",
++        "scopeAll": "Tous les sous-titres",
++        "scopeFrom": "Ce sous-titre et tous les suivants",
++        "shiftSubmit": "Décaler",
++        "shifted": "{{count}} sous-titres décalés de {{amount}} s",
++        "clamped": "{{count}} sous-titres décalés de {{amount}} s, aussi loin que possible sans chevauchement",
++        "nothingToShift": "Ces sous-titres ne peuvent pas être avancés davantage : ils commencent déjà juste après le précédent, ou à 0."
++      },
++      "errors": {
++        "invalid": "Ce n'est pas un temps. Utilisez minutes:secondes.millisecondes, par ex. 1:02.500.",
++        "beforeStart": "Les temps ne peuvent pas être avant 0.",
++        "tooShort": "La fin doit être au moins 0,1 seconde après le début.",
++        "overlapsPrevious": "Il chevaucherait le sous-titre précédent.",
++        "overlapsNext": "Il chevaucherait le sous-titre suivant. Raccourcissez-le ou cochez la case pour décaler les suivants.",
++        "emptyText": "Saisissez le texte du sous-titre."
++      }
+     }
+   },
+   "gettingStarted": {
+@@ -637,6 +686,41 @@
        "partial": "{{updated}} actualisés, {{failed}} en échec",
        "failed": "Impossible d’actualiser les styles"
      },
@@ -2841,7 +3965,7 @@ index eaf79f0..4da3588 100644
        "adding": "Envoi en cours...",
        "placedPartial": "{{placed}} sous-titres placés sur {{total}}",
 diff --git a/AutoSubs-App/src/i18n/locales/ja/translation.json b/AutoSubs-App/src/i18n/locales/ja/translation.json
-index 1bfdb8d..0b177c7 100644
+index 1bfdb8d..3355455 100644
 --- a/AutoSubs-App/src/i18n/locales/ja/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/ja/translation.json
 @@ -504,6 +504,12 @@
@@ -2857,7 +3981,57 @@ index 1bfdb8d..0b177c7 100644
      "previousSubtitles": "字幕履歴",
      "status": {
        "count_one": "字幕 {{count}} 件",
-@@ -637,6 +643,41 @@
+@@ -516,6 +522,49 @@
+       "lastWord": "最後の単語",
+       "toPrevious": "最初の単語を上へ ({{shortcut}})",
+       "toNext": "最後の単語を下へ ({{shortcut}})"
++    },
++    "timingTools": {
++      "start": "開始",
++      "end": "終了",
++      "cancel": "キャンセル",
++      "timeHint": "分:秒.ミリ秒（例: 1:02.500）。秒数だけでも入力できます。",
++      "insert": {
++        "button": "字幕を挿入",
++        "title": "字幕を挿入",
++        "description": "文字起こしで抜けた字幕を追加します。指定した範囲に合わせてタイミングが割り当てられます。",
++        "position": "位置",
++        "after": "この字幕の後",
++        "before": "この字幕の前",
++        "text": "テキスト",
++        "textPlaceholder": "表示する内容",
++        "makeRoom": "後ろの字幕を後ろにずらして場所を空ける",
++        "submit": "挿入"
++      },
++      "timing": {
++        "button": "タイミング",
++        "title": "字幕のタイミング",
++        "tabCaption": "この字幕",
++        "tabShift": "字幕をずらす",
++        "moveLater": "後ろの字幕も同じだけずらす",
++        "apply": "適用",
++        "amount": "ずらす量（秒）",
++        "amountHint": "前にずらすにはマイナスを付けます（例: -0.5）。",
++        "scope": "対象の字幕",
++        "scopeAll": "すべての字幕",
++        "scopeFrom": "この字幕以降すべて",
++        "shiftSubmit": "ずらす",
++        "shifted": "{{count}} 件の字幕を {{amount}} 秒ずらしました",
++        "clamped": "{{count}} 件の字幕を {{amount}} 秒ずらしました（重ならない範囲で最大）",
++        "nothingToShift": "これらの字幕はこれ以上前にずらせません。すでに前の字幕の直後か 0 から始まっています。"
++      },
++      "errors": {
++        "invalid": "時間として読み取れません。分:秒.ミリ秒（例: 1:02.500）で入力してください。",
++        "beforeStart": "0 より前の時間は指定できません。",
++        "tooShort": "終了は開始より 0.1 秒以上後にしてください。",
++        "overlapsPrevious": "前の字幕と重なります。",
++        "overlapsNext": "次の字幕と重なります。短くするか、後ろの字幕をずらすチェックを入れてください。",
++        "emptyText": "字幕の内容を入力してください。"
++      }
+     }
+   },
+   "theme": {
+@@ -637,6 +686,41 @@
        "partial": "{{updated}}件更新、{{failed}}件失敗",
        "failed": "タイムラインのスタイルを更新できませんでした"
      },
@@ -2900,7 +4074,7 @@ index 1bfdb8d..0b177c7 100644
        "adding": "送信中...",
        "placedPartial": "{{total}}件中{{placed}}件の字幕を配置しました",
 diff --git a/AutoSubs-App/src/i18n/locales/ko/translation.json b/AutoSubs-App/src/i18n/locales/ko/translation.json
-index e3bf390..9353d20 100644
+index e3bf390..60688b0 100644
 --- a/AutoSubs-App/src/i18n/locales/ko/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/ko/translation.json
 @@ -503,6 +503,12 @@
@@ -2916,7 +4090,57 @@ index e3bf390..9353d20 100644
      "previousSubtitles": "자막 기록",
      "waitingForSubtitles": "자막을 기다리는 중...",
      "status": {
-@@ -637,6 +643,41 @@
+@@ -516,6 +522,49 @@
+       "lastWord": "마지막 단어",
+       "toPrevious": "첫 단어 위로 이동 ({{shortcut}})",
+       "toNext": "마지막 단어 아래로 이동 ({{shortcut}})"
++    },
++    "timingTools": {
++      "start": "시작",
++      "end": "끝",
++      "cancel": "취소",
++      "timeHint": "분:초.밀리초 (예: 1:02.500). 초만 입력해도 됩니다.",
++      "insert": {
++        "button": "자막 삽입",
++        "title": "자막 삽입",
++        "description": "전사에서 빠진 자막을 추가합니다. 지정한 구간에 맞춰 타이밍이 배분됩니다.",
++        "position": "위치",
++        "after": "이 자막 뒤",
++        "before": "이 자막 앞",
++        "text": "텍스트",
++        "textPlaceholder": "어떤 내용을 표시할까요?",
++        "makeRoom": "뒤의 자막을 뒤로 밀어 공간 만들기",
++        "submit": "삽입"
++      },
++      "timing": {
++        "button": "타이밍",
++        "title": "자막 타이밍",
++        "tabCaption": "이 자막",
++        "tabShift": "자막 이동",
++        "moveLater": "뒤의 자막도 같은 만큼 이동",
++        "apply": "적용",
++        "amount": "이동량 (초)",
++        "amountHint": "앞으로 이동하려면 마이너스를 붙이세요 (예: -0.5).",
++        "scope": "대상 자막",
++        "scopeAll": "모든 자막",
++        "scopeFrom": "이 자막과 그 이후 전부",
++        "shiftSubmit": "이동",
++        "shifted": "자막 {{count}}개를 {{amount}}초 이동했습니다",
++        "clamped": "자막 {{count}}개를 {{amount}}초 이동했습니다 (겹치지 않는 최대 범위)",
++        "nothingToShift": "이 자막들은 더 앞으로 이동할 수 없습니다. 이미 앞 자막 바로 뒤나 0에서 시작합니다."
++      },
++      "errors": {
++        "invalid": "시간으로 읽을 수 없습니다. 분:초.밀리초 (예: 1:02.500) 형식으로 입력하세요.",
++        "beforeStart": "0보다 이전 시간은 지정할 수 없습니다.",
++        "tooShort": "끝은 시작보다 최소 0.1초 뒤여야 합니다.",
++        "overlapsPrevious": "앞 자막과 겹칩니다.",
++        "overlapsNext": "다음 자막과 겹칩니다. 길이를 줄이거나 뒤의 자막을 이동하도록 체크하세요.",
++        "emptyText": "자막 내용을 입력하세요."
++      }
+     }
+   },
+   "theme": {
+@@ -637,6 +686,41 @@
        "partial": "{{updated}}개 업데이트, {{failed}}개 실패",
        "failed": "타임라인 스타일을 업데이트하지 못했습니다"
      },
@@ -2959,7 +4183,7 @@ index e3bf390..9353d20 100644
        "adding": "전송 중...",
        "placedPartial": "자막 {{total}}개 중 {{placed}}개 배치",
 diff --git a/AutoSubs-App/src/i18n/locales/ru/translation.json b/AutoSubs-App/src/i18n/locales/ru/translation.json
-index 7eeafc1..18eafff 100644
+index 7eeafc1..29a90de 100644
 --- a/AutoSubs-App/src/i18n/locales/ru/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/ru/translation.json
 @@ -497,6 +497,12 @@
@@ -2975,7 +4199,57 @@ index 7eeafc1..18eafff 100644
      "previousSubtitles": "История субтитров",
      "empty": {
        "noSubtitlesAvailable": "Здесь появятся субтитры после завершения транскрибации"
-@@ -647,6 +653,41 @@
+@@ -512,6 +518,49 @@
+       "lastWord": "Последнее слово",
+       "toPrevious": "Первое слово вверх ({{shortcut}})",
+       "toNext": "Последнее слово вниз ({{shortcut}})"
++    },
++    "timingTools": {
++      "start": "Начало",
++      "end": "Конец",
++      "cancel": "Отмена",
++      "timeHint": "Минуты:секунды.миллисекунды, например 1:02.500. Можно указать просто секунды.",
++      "insert": {
++        "button": "Вставить субтитр",
++        "title": "Вставить субтитр",
++        "description": "Добавьте субтитр, пропущенный в расшифровке. Он распределяется по указанному промежутку.",
++        "position": "Куда",
++        "after": "После этого субтитра",
++        "before": "Перед этим субтитром",
++        "text": "Текст",
++        "textPlaceholder": "Что должно быть написано?",
++        "makeRoom": "Сдвинуть следующие субтитры позже, чтобы освободить место",
++        "submit": "Вставить"
++      },
++      "timing": {
++        "button": "Тайминг",
++        "title": "Тайминг субтитра",
++        "tabCaption": "Этот субтитр",
++        "tabShift": "Сдвиг субтитров",
++        "moveLater": "Сдвинуть следующие субтитры на столько же",
++        "apply": "Применить",
++        "amount": "Сдвиг (секунды)",
++        "amountHint": "Чтобы сдвинуть раньше, поставьте минус, например -0.5.",
++        "scope": "Какие субтитры",
++        "scopeAll": "Все субтитры",
++        "scopeFrom": "Этот субтитр и все последующие",
++        "shiftSubmit": "Сдвинуть",
++        "shifted": "Сдвинуто субтитров: {{count}}, на {{amount}} с",
++        "clamped": "Сдвинуто субтитров: {{count}}, на {{amount}} с — насколько возможно без наложения",
++        "nothingToShift": "Эти субтитры нельзя сдвинуть раньше: они уже начинаются сразу после предыдущего или с 0."
++      },
++      "errors": {
++        "invalid": "Это не время. Используйте минуты:секунды.миллисекунды, например 1:02.500.",
++        "beforeStart": "Время не может быть меньше 0.",
++        "tooShort": "Конец должен быть хотя бы на 0,1 секунды позже начала.",
++        "overlapsPrevious": "Он наложится на предыдущий субтитр.",
++        "overlapsNext": "Он наложится на следующий субтитр. Сократите его или отметьте сдвиг последующих субтитров.",
++        "emptyText": "Введите текст субтитра."
++      }
+     }
+   },
+   "gettingStarted": {
+@@ -647,6 +696,41 @@
        "partial": "Обновлено: {{updated}}, ошибок: {{failed}}",
        "failed": "Не удалось обновить стили таймлайна"
      },
@@ -3018,7 +4292,7 @@ index 7eeafc1..18eafff 100644
        "adding": "Отправка...",
        "placedPartial": "Размещено {{placed}} из {{total}} субтитров",
 diff --git a/AutoSubs-App/src/i18n/locales/zh/translation.json b/AutoSubs-App/src/i18n/locales/zh/translation.json
-index dbaea54..6b76b96 100644
+index dbaea54..a98ae72 100644
 --- a/AutoSubs-App/src/i18n/locales/zh/translation.json
 +++ b/AutoSubs-App/src/i18n/locales/zh/translation.json
 @@ -487,6 +487,12 @@
@@ -3034,7 +4308,57 @@ index dbaea54..6b76b96 100644
      "previousSubtitles": "字幕历史",
      "empty": {
        "noSubtitlesAvailable": "转录完成后，字幕将显示在这里"
-@@ -637,6 +643,41 @@
+@@ -502,6 +508,49 @@
+       "lastWord": "末词",
+       "toPrevious": "首词上移 ({{shortcut}})",
+       "toNext": "末词下移 ({{shortcut}})"
++    },
++    "timingTools": {
++      "start": "开始",
++      "end": "结束",
++      "cancel": "取消",
++      "timeHint": "分:秒.毫秒，例如 1:02.500。也可以只填秒数。",
++      "insert": {
++        "button": "插入字幕",
++        "title": "插入字幕",
++        "description": "添加转写中遗漏的字幕。它会按您给出的时间段分配时间。",
++        "position": "位置",
++        "after": "在此字幕之后",
++        "before": "在此字幕之前",
++        "text": "文本",
++        "textPlaceholder": "要显示什么内容？",
++        "makeRoom": "将后面的字幕后移以腾出位置",
++        "submit": "插入"
++      },
++      "timing": {
++        "button": "时间",
++        "title": "字幕时间",
++        "tabCaption": "此字幕",
++        "tabShift": "平移字幕",
++        "moveLater": "将后面的字幕移动相同的量",
++        "apply": "应用",
++        "amount": "移动量（秒）",
++        "amountHint": "加负号表示提前，例如 -0.5。",
++        "scope": "哪些字幕",
++        "scopeAll": "所有字幕",
++        "scopeFrom": "此字幕及之后的全部字幕",
++        "shiftSubmit": "平移",
++        "shifted": "已将 {{count}} 条字幕移动 {{amount}} 秒",
++        "clamped": "已将 {{count}} 条字幕移动 {{amount}} 秒（在不重叠的前提下尽可能多）",
++        "nothingToShift": "这些字幕无法再提前：它们已紧接在前一条字幕之后，或从 0 开始。"
++      },
++      "errors": {
++        "invalid": "这不是有效的时间。请使用 分:秒.毫秒，例如 1:02.500。",
++        "beforeStart": "时间不能早于 0。",
++        "tooShort": "结束时间必须比开始时间至少晚 0.1 秒。",
++        "overlapsPrevious": "它会与前一条字幕重叠。",
++        "overlapsNext": "它会与后一条字幕重叠。请缩短它，或勾选移动后面的字幕。",
++        "emptyText": "请输入字幕内容。"
++      }
+     }
+   },
+   "gettingStarted": {
+@@ -637,6 +686,41 @@
        "partial": "已更新 {{updated}} 个，失败 {{failed}} 个",
        "failed": "无法更新时间线样式"
      },
@@ -3076,6 +4400,286 @@ index dbaea54..6b76b96 100644
      "send": {
        "adding": "正在发送...",
        "placedPartial": "已放置 {{total}} 条字幕中的 {{placed}} 条",
+diff --git a/AutoSubs-App/src/lib/caption-timing.ts b/AutoSubs-App/src/lib/caption-timing.ts
+new file mode 100644
+index 0000000..5ddd98e
+--- /dev/null
++++ b/AutoSubs-App/src/lib/caption-timing.ts
+@@ -0,0 +1,274 @@
++import type { Subtitle, Word } from "@/types";
++
++/**
++ * Editing when captions appear: inserting a new caption between others,
++ * changing one caption's start and end, and shifting many at once.
++ *
++ * A caption's words carry their own timing (the animated caption highlights
++ * them one by one), so whenever a caption moves its words move with it. Every
++ * function here returns a new list and never changes the one it is given.
++ * Captions are never allowed to overlap or change order: an edit that would do
++ * that is refused with a reason the interface can show.
++ */
++
++/** The shortest caption these tools will make, in seconds. */
++export const MIN_CAPTION_SECONDS = 0.1;
++
++/** Times closer than this are treated as equal. */
++const EPSILON = 0.0005;
++
++export type TimingError =
++    | "invalid"          // a time that is not a number
++    | "beforeStart"      // a time before 0
++    | "tooShort"         // the end is not after the start
++    | "overlapsPrevious" // it would start before the caption before it ends
++    | "overlapsNext"     // it would end after the caption after it starts
++    | "emptyText";       // a new caption with nothing in it
++
++export interface TimingResult {
++    subtitles: Subtitle[];
++    error?: TimingError;
++    /**
++     * When later captions were moved: those that started at or after `from`
++     * (in the old timing) moved by `offset` seconds. Pinned styles are keyed by
++     * time, so the caller moves them by the same amount.
++     */
++    shift?: { from: number; offset: number };
++}
++
++const num = (value: unknown) => Number(value);
++
++/** Ids follow position in the list, as they do after the app formats captions. */
++function renumber(subtitles: Subtitle[]): Subtitle[] {
++    return subtitles.map((cue, index) => (cue.id === index ? cue : { ...cue, id: index }));
++}
++
++/**
++ * Move a caption's words from its old span to a new one, keeping where each
++ * falls within the caption. A caption with no length spreads them evenly.
++ */
++export function retimeWords(
++    words: ReadonlyArray<Word>,
++    oldStart: number,
++    oldEnd: number,
++    newStart: number,
++    newEnd: number,
++): Word[] {
++    const span = oldEnd - oldStart;
++    const clamp = (time: number) => Math.min(newEnd, Math.max(newStart, time));
++    if (span > EPSILON) {
++        const scale = (newEnd - newStart) / span;
++        const map = (time: number) => clamp(newStart + (num(time) - oldStart) * scale);
++        return words.map(word => ({ ...word, start: map(word.start), end: map(word.end) }));
++    }
++    const each = words.length ? (newEnd - newStart) / words.length : 0;
++    return words.map((word, index) => ({
++        ...word,
++        start: newStart + each * index,
++        end: newStart + each * (index + 1),
++    }));
++}
++
++function retimeCue(cue: Subtitle, start: number, end: number): Subtitle {
++    return {
++        ...cue,
++        start,
++        end,
++        words: retimeWords(cue.words ?? [], num(cue.start), num(cue.end), start, end),
++    };
++}
++
++function shiftCue(cue: Subtitle, offset: number): Subtitle {
++    return retimeCue(cue, num(cue.start) + offset, num(cue.end) + offset);
++}
++
++/**
++ * Timed words for typed text: one word per space-separated token (or the whole
++ * text, for languages written without spaces), spread across the caption by
++ * length so longer words get longer.
++ */
++export function wordsForText(text: string, start: number, end: number): Word[] {
++    const trimmed = text.replace(/\s+/g, " ").trim();
++    if (!trimmed) return [];
++    const tokens = trimmed.split(" ");
++    const weight = tokens.reduce((sum, token) => sum + Array.from(token).length, 0) || 1;
++    let consumed = 0;
++    return tokens.map((token, index) => {
++        const wordStart = start + (end - start) * consumed / weight;
++        consumed += Array.from(token).length;
++        const wordEnd = start + (end - start) * consumed / weight;
++        return { word: index ? ` ${token}` : token, start: wordStart, end: wordEnd, line_number: 0 };
++    });
++}
++
++function checkSpan(start: number, end: number): TimingError | undefined {
++    if (!Number.isFinite(start) || !Number.isFinite(end)) return "invalid";
++    if (start < -EPSILON) return "beforeStart";
++    if (end - start < MIN_CAPTION_SECONDS - EPSILON) return "tooShort";
++    return undefined;
++}
++
++/**
++ * Give one caption a new start and end.
++ *
++ * With `moveLater`, every caption after it moves by however much its end moved,
++ * so the gaps after it are kept: extend a caption by half a second and the rest
++ * of the captions slide half a second later to make room.
++ */
++export function setCaptionTiming(
++    subtitles: ReadonlyArray<Subtitle>,
++    index: number,
++    start: number,
++    end: number,
++    moveLater: boolean,
++): TimingResult {
++    const list = [...subtitles];
++    const cue = list[index];
++    if (!cue) return { subtitles: list, error: "invalid" };
++    const spanError = checkSpan(start, end);
++    if (spanError) return { subtitles: list, error: spanError };
++
++    const previous = list[index - 1];
++    if (previous && start < num(previous.end) - EPSILON) return { subtitles: list, error: "overlapsPrevious" };
++
++    const next = list[index + 1];
++    const endDelta = end - num(cue.end);
++    if (next && !moveLater && end > num(next.start) + EPSILON) return { subtitles: list, error: "overlapsNext" };
++
++    list[index] = retimeCue(cue, start, end);
++    let shift: TimingResult["shift"];
++    if (moveLater && next && Math.abs(endDelta) > EPSILON) {
++        shift = { from: num(next.start), offset: endDelta };
++        for (let i = index + 1; i < list.length; i++) list[i] = shiftCue(list[i], endDelta);
++    }
++    return { subtitles: renumber(list), shift };
++}
++
++/**
++ * Move captions by `offset` seconds: every caption from `fromIndex` to the end
++ * (pass 0 for all of them). Moving earlier stops where the caption before them
++ * ends, or at 0, whichever comes first; `appliedOffset` says how far they moved.
++ */
++export function shiftCaptions(
++    subtitles: ReadonlyArray<Subtitle>,
++    fromIndex: number,
++    offset: number,
++): TimingResult & { appliedOffset: number; clamped: boolean } {
++    const list = [...subtitles];
++    const first = list[fromIndex];
++    if (!first || !Number.isFinite(offset)) {
++        return { subtitles: list, error: "invalid", appliedOffset: 0, clamped: false };
++    }
++    const floor = fromIndex > 0 ? num(list[fromIndex - 1].end) : 0;
++    const lowest = floor - num(first.start);
++    const applied = Math.max(offset, Math.min(0, lowest));
++    const clamped = applied !== offset;
++    if (Math.abs(applied) <= EPSILON) {
++        return { subtitles: list, appliedOffset: 0, clamped };
++    }
++    for (let i = fromIndex; i < list.length; i++) list[i] = shiftCue(list[i], applied);
++    return {
++        subtitles: renumber(list),
++        shift: { from: num(first.start), offset: applied },
++        appliedOffset: applied,
++        clamped,
++    };
++}
++
++/** A sensible start and end for a caption inserted at `position`. */
++export function suggestInsertSlot(
++    subtitles: ReadonlyArray<Subtitle>,
++    position: number,
++): { start: number; end: number; needsRoom: boolean } {
++    const previous = subtitles[position - 1];
++    const next = subtitles[position];
++    const DEFAULT = 1.5;
++    const LONGEST = 5;
++    const start = previous ? num(previous.end) : next ? Math.max(0, num(next.start) - DEFAULT) : 0;
++    const limit = next ? num(next.start) : Infinity;
++    if (limit - start >= MIN_CAPTION_SECONDS) {
++        return { start, end: Math.min(limit, start + LONGEST), needsRoom: false };
++    }
++    return { start, end: start + DEFAULT, needsRoom: true };
++}
++
++/**
++ * Add a caption at `position` in the list (0 puts it first). Its words are
++ * timed across it. With `makeRoom`, captions after it move later by however
++ * much it would otherwise overlap the next one.
++ */
++export function insertCaption(
++    subtitles: ReadonlyArray<Subtitle>,
++    position: number,
++    caption: { text: string; start: number; end: number; speakerId?: string },
++    makeRoom: boolean,
++): TimingResult & { index: number } {
++    const list = [...subtitles];
++    const at = Math.max(0, Math.min(position, list.length));
++    const text = caption.text.replace(/\s+/g, " ").trim();
++    if (!text) return { subtitles: list, error: "emptyText", index: at };
++    const spanError = checkSpan(caption.start, caption.end);
++    if (spanError) return { subtitles: list, error: spanError, index: at };
++
++    const previous = list[at - 1];
++    if (previous && caption.start < num(previous.end) - EPSILON) {
++        return { subtitles: list, error: "overlapsPrevious", index: at };
++    }
++    const next = list[at];
++    let shift: TimingResult["shift"];
++    if (next && caption.end > num(next.start) + EPSILON) {
++        if (!makeRoom) return { subtitles: list, error: "overlapsNext", index: at };
++        const offset = caption.end - num(next.start);
++        shift = { from: num(next.start), offset };
++        for (let i = at; i < list.length; i++) list[i] = shiftCue(list[i], offset);
++    }
++
++    const cue: Subtitle = {
++        id: at,
++        start: caption.start,
++        end: caption.end,
++        text,
++        words: wordsForText(text, caption.start, caption.end),
++        speaker_id: caption.speakerId,
++        inserted: true,
++    };
++    list.splice(at, 0, cue);
++    return { subtitles: renumber(list), shift, index: at };
++}
++
++/** "1:02.350", or "1:02:03.350" past an hour. */
++export function formatPreciseTime(seconds: number): string {
++    const total = Math.max(0, Math.round(num(seconds) * 1000));
++    const ms = total % 1000;
++    const whole = Math.floor(total / 1000);
++    const hours = Math.floor(whole / 3600);
++    const minutes = Math.floor((whole % 3600) / 60);
++    const secs = whole % 60;
++    const tail = `${String(secs).padStart(2, "0")}.${String(ms).padStart(3, "0")}`;
++    return hours > 0
++        ? `${hours}:${String(minutes).padStart(2, "0")}:${tail}`
++        : `${minutes}:${tail}`;
++}
++
++/**
++ * Read a typed time: "1:02:03.5", "2:03.25", "123.4" or "2,5". Returns seconds,
++ * or null when it is not a time. With `allowSign` a leading + or - is kept,
++ * for amounts to move captions by.
++ */
++export function parseTimeInput(input: string, allowSign = false): number | null {
++    let text = input.trim().replace(",", ".");
++    let sign = 1;
++    if (allowSign && (text.startsWith("-") || text.startsWith("+"))) {
++        sign = text.startsWith("-") ? -1 : 1;
++        text = text.slice(1).trim();
++    }
++    if (!text) return null;
++    const parts = text.split(":");
++    if (parts.length > 3 || parts.some(part => !/^\d+(\.\d+)?$/.test(part))) return null;
++    // Only the last part may have a decimal.
++    if (parts.slice(0, -1).some(part => part.includes("."))) return null;
++    let seconds = 0;
++    for (const part of parts) seconds = seconds * 60 + Number(part);
++    if (parts.length > 1 && Number(parts[parts.length - 1]) >= 60) return null;
++    return sign * seconds;
++}
 diff --git a/AutoSubs-App/src/lib/keyframe-report.ts b/AutoSubs-App/src/lib/keyframe-report.ts
 new file mode 100644
 index 0000000..c9ab746
@@ -3138,10 +4742,10 @@ index 0000000..c9ab746
 +}
 diff --git a/AutoSubs-App/src/lib/line-styles.ts b/AutoSubs-App/src/lib/line-styles.ts
 new file mode 100644
-index 0000000..3d4e2ce
+index 0000000..cd7a568
 --- /dev/null
 +++ b/AutoSubs-App/src/lib/line-styles.ts
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,146 @@
 +import type { CaptionPreset, PresetOverride, Subtitle } from "@/types";
 +
 +/**
@@ -3207,6 +4811,39 @@ index 0000000..3d4e2ce
 +    return [...kept, { start: Number(cue.start), end: Number(cue.end), presetId }];
 +}
 +
++/**
++ * Keep each caption's pinned style with that caption after captions were
++ * retimed or added. `newIndexOf` says where each caption of `before` sits in
++ * `after`. Assignments not on any caption are kept as they were.
++ *
++ * Pairing styles with captions, rather than shifting time ranges, is what keeps
++ * this right when captions move into each other's old places (shorten a caption
++ * and pull the rest in, and the next caption now sits where it used to be).
++ */
++export function remapPresetOverrides(
++    overrides: ReadonlyArray<PresetOverride> | undefined,
++    before: ReadonlyArray<{ start: number; end: number }>,
++    after: ReadonlyArray<{ start: number; end: number }>,
++    newIndexOf: (oldIndex: number) => number,
++): PresetOverride[] {
++    const list = overrides ?? [];
++    if (!list.length) return [];
++    const onCaption = new Set<PresetOverride>();
++    const moved: PresetOverride[] = [];
++    before.forEach((cue, oldIndex) => {
++        const time = midpoint(cue);
++        let pinned: PresetOverride | undefined;
++        for (let i = list.length - 1; i >= 0; i--) {
++            if (covers(list[i], time)) { pinned = list[i]; break; }
++        }
++        if (!pinned) return;
++        onCaption.add(pinned);
++        const target = after[newIndexOf(oldIndex)];
++        if (target) moved.push({ start: Number(target.start), end: Number(target.end), presetId: pinned.presetId });
++    });
++    return [...list.filter((o) => !onCaption.has(o)), ...moved];
++}
++
 +/** What the Lua server needs to style individual cues differently. */
 +export interface LineStyles {
 +    /** Subtitle id (as a string) -> preset id. */
@@ -3268,10 +4905,23 @@ index bd45123..b71f575 100644
  
  // ─── Persisted-shape normalisation ────────────────────────────────────────
 diff --git a/AutoSubs-App/src/types.ts b/AutoSubs-App/src/types.ts
-index 7056ae6..a78d0dc 100644
+index 7056ae6..0b4f4f8 100644
 --- a/AutoSubs-App/src/types.ts
 +++ b/AutoSubs-App/src/types.ts
-@@ -69,6 +69,17 @@ export type DraftSubtitle = Omit<Subtitle, 'id'> & {
+@@ -50,6 +50,12 @@ export interface Subtitle {
+     text: string;
+     words: Array<Word>;
+     speaker_id?: string;
++    /**
++     * A caption the user added by hand. It has no words in the transcript
++     * underneath, so the next reformat adds them there (see
++     * preserveSubtitleEdits); until then this marks it apart.
++     */
++    inserted?: boolean;
+ }
+ 
+ /**
+@@ -69,6 +75,17 @@ export type DraftSubtitle = Omit<Subtitle, 'id'> & {
      stage?: SegmentStage;
  };
  
@@ -3289,7 +4939,7 @@ index 7056ae6..a78d0dc 100644
  export interface Sample {
      start: number;
      end: number;
-@@ -183,6 +194,10 @@ export interface Settings {
+@@ -183,6 +200,10 @@ export interface Settings {
  
      // Caption style: which of the two kinds of caption to send, and which one.
      captionStyle: CaptionStyle;
@@ -3430,10 +5080,53 @@ index 9f33739..ba21cbd 100644
      return sanitized
          .map((sub, i) => {
 diff --git a/AutoSubs-App/src/utils/subtitle-edits.ts b/AutoSubs-App/src/utils/subtitle-edits.ts
-index 056a54c..882e874 100644
+index 056a54c..561a54d 100644
 --- a/AutoSubs-App/src/utils/subtitle-edits.ts
 +++ b/AutoSubs-App/src/utils/subtitle-edits.ts
-@@ -92,6 +92,19 @@ export function preserveSubtitleEdits(
+@@ -3,6 +3,10 @@ import type { Subtitle, Word } from '../types';
+ 
+ const normalize = (text: string) => text.replace(/\s+/g, ' ').trim();
+ 
++/** Word times closer than this (seconds) are the same time. The formatter
++ * rounds to the millisecond, so anything further apart was moved by the user. */
++const TIME_TOLERANCE = 0.002;
++
+ // Match unchanged words inside a correction, including repeated words. This
+ // keeps corrections on both sides of a word from baking its display formatting
+ // into the editable source.
+@@ -59,8 +63,7 @@ export function preserveSubtitleEdits(
+     // Flatten the displayed words and find which cues the user edited. A cue
+     // renders its tokens the same way the formatter does; any difference is an
+     // edit, and a word move shows up as a pair of adjacent edited cues.
+-    const displayCues = displayed.map((cue, cueIndex) => {
+-        const words = cue.words ?? [];
++    const render = (words: Word[]) => {
+         let rendered = '';
+         const tokens = words.map((word, index) => {
+             const token = word.word.trim();
+@@ -71,7 +74,20 @@ export function preserveSubtitleEdits(
+             rendered += token;
+             return token;
+         });
+-        return { cueIndex, cue, words, tokens, from: 0, to: 0, changed: rendered !== normalize(cue.text) };
++        return { rendered, tokens };
++    };
++    const displayCues = displayed.map((cue, cueIndex) => {
++        // A caption the user inserted has no words in the source. It stands
++        // apart from the comparison (so the rest still lines up word for word)
++        // and is added to the source by time at the end.
++        if (cue.inserted) {
++            return { cueIndex, cue, words: [] as Word[], tokens: [] as string[], from: 0, to: 0,
++                changed: false, inserted: true };
++        }
++        const words = cue.words ?? [];
++        const { rendered, tokens } = render(words);
++        return { cueIndex, cue, words, tokens, from: 0, to: 0, changed: rendered !== normalize(cue.text),
++            inserted: false };
+     });
+     let flat = 0;
+     for (const entry of displayCues) {
+@@ -92,6 +108,40 @@ export function preserveSubtitleEdits(
              if (groups.some(group => group !== groups[0])) entry.changed = true;
          }
      }
@@ -3450,9 +5143,76 @@ index 056a54c..882e874 100644
 +            }
 +        }
 +    }
++    // A caption the user moved in time keeps its text, so only its words' times
++    // show the edit. Copy them into the source before anything else reads it.
++    let timingChanged = false;
++    if (aligned) {
++        for (const entry of displayCues) {
++            entry.words.forEach((word, offset) => {
++                const at = entry.from + offset;
++                const source = sourceWords[at];
++                if (!source) return;
++                const start = Number(word.start);
++                const end = Number(word.end);
++                if (Math.abs(start - Number(source.word.start)) > TIME_TOLERANCE ||
++                    Math.abs(end - Number(source.word.end)) > TIME_TOLERANCE) {
++                    sourceWords[at] = { ...source, word: { ...source.word, start, end } };
++                    timingChanged = true;
++                }
++            });
++        }
++    }
++    const insertedCues = displayCues.filter(entry => entry.inserted && normalize(entry.cue.text ?? ''));
++
      // The source group a caption belongs to. For a caption that gained words
      // from its neighbours, that is a group neither neighbour shares.
      const homeGroup = (cueIndex: number) => {
+@@ -120,7 +170,7 @@ export function preserveSubtitleEdits(
+             runs.push([entry]);
+         }
+     }
+-    if (!runs.length) return { segments: source, changed: false };
++    if (!runs.length && !timingChanged && !insertedCues.length) return { segments: source, changed: false };
+ 
+     type Entry = { word: Word; group: number; speaker: string | undefined };
+     const patches: { start: number; count: number; words: Entry[] }[] = [];
+@@ -245,6 +295,36 @@ export function preserveSubtitleEdits(
+     for (const patch of patches.sort((x, y) => y.start - x.start)) {
+         sourceWords.splice(patch.start, patch.count, ...patch.words);
+     }
++
++    // Add the captions the user inserted, each as a group of its own so it stays
++    // a caption of its own, placed among the source words by when it starts.
++    let freshGroup = sourceWords.reduce((max, entry) => Math.max(max, entry.group), -1) + 1;
++    for (const entry of insertedCues) {
++        const cue = entry.cue;
++        const text = normalize(cue.text);
++        const cueStart = Number(cue.start);
++        const cueEnd = Number(cue.end);
++        const own = cue.words ?? [];
++        let newWords: Word[];
++        if (own.length && render(own).rendered === text) {
++            newWords = own.map(word => ({ ...word, start: Number(word.start), end: Number(word.end) }));
++        } else {
++            // Its text was edited since it was added: time the words afresh.
++            const tokens = tokenize(text);
++            const weight = tokens.reduce((sum, token) => sum + Array.from(token).length, 0) || 1;
++            let consumed = 0;
++            newWords = tokens.map(token => {
++                const start = cueStart + (cueEnd - cueStart) * consumed / weight;
++                consumed += Array.from(token).length;
++                const end = cueStart + (cueEnd - cueStart) * consumed / weight;
++                return { word: `${usesSpaces ? ' ' : ''}${token}`, start, end, line_number: 0 } as Word;
++            });
++        }
++        const group = freshGroup++;
++        const at = sourceWords.findIndex(item => Number(item.word.start) >= cueStart - TIME_TOLERANCE);
++        sourceWords.splice(at >= 0 ? at : sourceWords.length, 0,
++            ...newWords.map(word => ({ word, group, speaker: cue.speaker_id })));
++    }
+     const segments: Subtitle[] = [];
+     let previousGroup: number | undefined;
+     let previousSpeaker: string | undefined;
 diff --git a/AutoSubs-App/src/utils/transcript-txt.ts b/AutoSubs-App/src/utils/transcript-txt.ts
 index 0c2f602..eab30de 100644
 --- a/AutoSubs-App/src/utils/transcript-txt.ts
@@ -3475,7 +5235,7 @@ index 0c2f602..eab30de 100644
  
    for (const subtitle of normalizedSubtitles) {
 diff --git a/AutoSubs-App/tests/mock_resolve_test.lua b/AutoSubs-App/tests/mock_resolve_test.lua
-index d7006f8..70ab96f 100644
+index d7006f8..fafcd94 100644
 --- a/AutoSubs-App/tests/mock_resolve_test.lua
 +++ b/AutoSubs-App/tests/mock_resolve_test.lua
 @@ -23,6 +23,7 @@ local function make_tool()
@@ -3486,7 +5246,7 @@ index d7006f8..70ab96f 100644
      return tool
  end
  
-@@ -127,6 +128,71 @@ local function make_timeline(opts)
+@@ -127,6 +128,79 @@ local function make_timeline(opts)
      return tl
  end
  
@@ -3514,6 +5274,14 @@ index d7006f8..70ab96f 100644
 +    function spline:SetKeyFrames(kf)
 +        if self.failWrite then error("Fusion refused the keyframes") end
 +        local stored = copy_all(kf)
++        -- Like Fusion, keyframes sit on whole frames: a fractional time is rounded
++        -- when written, so it reads back different from what was asked for.
++        -- (opts.subframes = true keeps them as written.)
++        if not opts.subframes then
++            local snapped = {}
++            for t, k in pairs(stored) do snapped[math.floor(t + 0.5)] = k end
++            stored = snapped
++        end
 +        if opts.corruptFirstWrite and not self._corrupted then
 +            self._corrupted = true
 +            for _, k in pairs(stored) do
@@ -3558,7 +5326,7 @@ index d7006f8..70ab96f 100644
  local function make_media_pool(timeline, opts)
      opts = opts or {}
      local mp = { tl = timeline, templateFPS = opts.templateFPS or 24 }
-@@ -142,9 +208,29 @@ local function make_media_pool(timeline, opts)
+@@ -142,9 +216,29 @@ local function make_media_pool(timeline, opts)
          GetUniqueId = function() return "tpl-1" end,
      }
      mp.templateClip = templateClip
@@ -3589,7 +5357,7 @@ index d7006f8..70ab96f 100644
          GetName = function() return "Master" end,
      }
      function mp:GetRootFolder() return rootFolder end
-@@ -182,8 +268,22 @@ local function make_media_pool(timeline, opts)
+@@ -182,8 +276,26 @@ local function make_media_pool(timeline, opts)
              elseif blocked then
                  results[i] = dead_handle()
              else
@@ -3607,13 +5375,17 @@ index d7006f8..70ab96f 100644
 +                if self.titleSplines and (isTitle or self.splinesOnAll) then
 +                    attach_splines(comp, self.titleSplines())
 +                end
++                -- Like Resolve, a placed clip's composition spans the clip, from frame 0.
++                -- `compFrames` forces another length, as if Resolve had not stretched it.
++                local compLength = self.compFrames or (e - s)
++                function comp:GetAttrs() return { COMPN_GlobalStart = 0, COMPN_GlobalEnd = compLength - 1 } end
 +                local item = make_item(s, e, self.noComps and nil or comp)
                  item._sourceTrack = ci.trackIndex
 +                item._source = ci.mediaPoolItem
                  table.insert(track.items, item and { handle = item } or nil)
                  results[i] = item
              end
-@@ -747,5 +847,1159 @@ do
+@@ -747,5 +859,1266 @@ do
      check_marker_move(2, 50, 38, "marker move with lead-in")
  end
  
@@ -4279,8 +6051,13 @@ index d7006f8..70ab96f 100644
 +        check(same(got, { 0, 10, 16, 35 }), "keyframes/short: intro kept, outro moved to the end", show(got))
 +        local kf = created[1]._kf
 +        check(kf[16][1] == 1 and kf[35][1] == 0, "keyframes/short: values travel with their keyframes")
-+        check(handle_is(kf[16].LH, -26, 0) and handle_is(kf[35].LH, -0.2, 1.39),
-+            "keyframes/short: and handles keep their numbers, whichever way the move goes")
++        check(handle_is(kf[35].LH, -0.2, 1.39) and handle_is(kf[0].RH, 0.2, 1.4) and handle_is(kf[10].LH, -3, 0),
++            "keyframes/short: handles outside the hold keep their numbers")
++        -- The hold shrank from 90 frames (10 to 100) to 6 (10 to 16): the two handles
++        -- reaching into it shrink by the same proportion, keeping their height.
++        check(handle_is(kf[10].RH, 5 * 6 / 90, 0) and handle_is(kf[16].LH, -26 * 6 / 90, 0),
++            "keyframes/short: the handles reaching into the hold shrink with it")
++        check(kf[10].RH[1] - kf[16].LH[1] <= 6, "keyframes/short: and no longer reach past each other across it")
 +        check(same(times_of(created[3]), { 0, 10, 16, 35 }), "keyframes/short: every clip is fitted")
 +    end
 +
@@ -4291,9 +6068,10 @@ index d7006f8..70ab96f 100644
 +        local r = send(captions(20 / 24))
 +        check(r.ok == true, "keyframes/tiny: sent", tostring(r.error))
 +        local got = times_of(created[1])
-+        check(near(got, { 0, 10 / 6, 100 / 6, 119 / 6 }), "keyframes/tiny: squeezed proportionally", show(got))
++        -- Frames 0..119 map onto 0..19: whole frames, the last on the last frame.
++        check(same(got, { 0, 2, 16, 19 }), "keyframes/tiny: squeezed onto whole frames", show(got))
 +        local kf = created[1]._kf
-+        check(handle_is(kf[got[3]].LH, -26 / 6, 0) and handle_is(kf[got[4]].LH, -0.2 / 6, 1.39),
++        check(kf[16] ~= nil and kf[19] ~= nil and handle_is(kf[16].LH, -26 * 19 / 119, 0) and handle_is(kf[19].LH, -0.2 * 19 / 119, 1.39),
 +            "keyframes/tiny: handle reach scales with time, their height does not")
 +    end
 +
@@ -4436,14 +6214,16 @@ index d7006f8..70ab96f 100644
 +        title_pool()
 +        local r = send(captions(1.5))
 +        local report = r.keyframeReport or ""
-+        check(report:find("Keyframe fitting v3", 1, true) ~= nil, "keyframes/report: says which version ran", report)
++        check(report:find("Keyframe fitting v5", 1, true) ~= nil, "keyframes/report: says which version ran", report)
 +        check(report:find("Title length: 120 frames (reported by Resolve)", 1, true) ~= nil,
 +            "keyframes/report: says how long the title is", report)
 +        check(report:find("Caption: 36 frames at 24 fps", 1, true) ~= nil, "keyframes/report: and the caption")
 +        check(report:find("Fitted 'Opacity1'", 1, true) ~= nil and report:find("0.00=0 RH(0.20,1.4)", 1, true) ~= nil,
 +            "keyframes/report: shows the keyframes and handles before", report)
-+        check(report:find("16.00=1 LH(-26.00,0)", 1, true) ~= nil and report:find("35.00=0 LH(-0.20,1.39)", 1, true) ~= nil,
-+            "keyframes/report: and after")
++        check(report:find("16.00=1 LH(-1.73,0)", 1, true) ~= nil and report:find("35.00=0 LH(-0.20,1.39)", 1, true) ~= nil,
++            "keyframes/report: and after", report)
++        check(report:find("(composition frames 0 to 35)", 1, true) ~= nil,
++            "keyframes/report: and the frames the placed clip's composition spans", report)
 +        check(report:find("across 3 clips", 1, true) ~= nil, "keyframes/report: summarises the whole send")
 +    end
 +    do
@@ -4489,6 +6269,27 @@ index d7006f8..70ab96f 100644
 +            "keyframes/toggle: and come back as authored", created[1] and show(times_of(created[1])))
 +        local again = sync(captions(1.5), { fitTitleKeyframes = false })
 +        check(again.ok == true and again.unchanged == 3, "keyframes/toggle: a second sync changes nothing", tostring(again.unchanged))
++    end
++
++    -- A hold that gets LONGER leaves its handles exactly as authored.
++    do
++        print("\n=== keyframes: a longer hold keeps its handles ===")
++        title_pool()
++        send(captions(10)) -- 240 frames: the outro moves later
++        local kf = created[1]._kf
++        check(handle_is(kf[10].RH, 5, 0) and handle_is(kf[220].LH, -26, 0), "keyframes/longhold: handles unchanged")
++    end
++
++    -- If Resolve made the clip a different length from the caption (say it would not
++    -- stretch the title), the animation is fitted to what the composition spans.
++    do
++        print("\n=== keyframes: the composition is not the caption's length ===")
++        title_pool({ compFrames = 120 })
++        local r = send(captions(10)) -- a 240 frame caption, but only 120 frames of composition
++        check(same(times_of(created[1]), { 0, 10, 100, 119 }), "keyframes/comp: fitted to the 120 frames that exist",
++            show(times_of(created[1])))
++        check((r.keyframeReport or ""):find("so the animation was fitted to 120 frames", 1, true) ~= nil,
++            "keyframes/comp: and the report says so", tostring(r.keyframeReport))
 +    end
 +
 +    -- ---- The titles reported from a real project --------------------------------------------
@@ -4547,10 +6348,88 @@ index d7006f8..70ab96f 100644
 +        multi_pool(97, punch_in)
 +        one_caption(20)
 +        local size, angle = times_of(created[1]), times_of(created[2])
-+        local factor = 20 / 98
-+        check(near(size, { 14 * factor, 25 * factor, 90 * factor, 97 * factor }),
-+            "keyframes/punchin-short: Size squeezed", show(size))
-+        check(near(angle, { 90 * factor, 97 * factor }), "keyframes/punchin-short: Angle squeezed by the same factor", show(angle))
++        check(same(size, { 3, 5, 18, 19 }), "keyframes/punchin-short: Size squeezed onto whole frames", show(size))
++        check(same(angle, { 18, 19 }), "keyframes/punchin-short: Angle lands on the same frames as Size", show(angle))
++    end
++
++    -- Short captions for the real titles: the curve never doubles back in the hold.
++    do
++        print("\n=== keyframes: real titles on short captions ===")
++        -- How far each segment's handles reach, as a share of the segment.
++        local function reaches(kfs)
++            local ts = {}
++            for t in pairs(kfs) do ts[#ts + 1] = t end
++            table.sort(ts)
++            local out = {}
++            for i = 1, #ts - 1 do
++                local a, b = kfs[ts[i]], kfs[ts[i + 1]]
++                out[i] = ((a.RH and a.RH[1] or 0) + (b.LH and -b.LH[1] or 0)) / (ts[i + 1] - ts[i])
++            end
++            return out
++        end
++        -- No segment may overreach more than it did in the title as authored.
++        local function no_overreach(sp)
++            local before, after = reaches(punch_in_size()), reaches(sp._kf)
++            for i = 1, #before do
++                if after[i] > math.max(1, before[i]) + 1e-6 then return false, string.format("segment %d: %.2f", i, after[i]) end
++            end
++            return true
++        end
++        for _, frames in ipairs({ 45, 60 }) do
++            multi_pool(97, punch_in)
++            one_caption(frames)
++            local ok, where = no_overreach(created[1])
++            check(ok, "keyframes/overreach: Punch In Size on a " .. frames .. " frame caption", where)
++        end
++    end
++
++    -- REPORTED FROM CAPTIONS AUTOSUBS PLACED: these two were left exactly as authored, so their
++    -- outros fell past the end of the clip. Both needed squeezing, which produced fractional
++    -- keyframe times (and a last keyframe past the last frame); Fusion keeps keyframes on whole
++    -- frames, the result read back different, and the check put the original back.
++    do
++        print("\n=== keyframes: Quick Fade on a 48 frame caption (as placed) ===")
++        multi_pool(62, { { name = "Transform1Size", make = function()
++            return {
++                [14] = { 0, RH = { 7, 0 } },
++                [35] = { 0, LH = { -7, 0 }, RH = { 3.5, 1.38 } },
++                [40] = { 1.01, LH = { -2.2, 0.0139 }, RH = { 24, -0.00205 } },
++                [112] = { 1, LH = { -24, 0.00205 }, RH = { 7, -0.004 } },
++                [119] = { 0, LH = { 0, 1.32 } },
++            }
++        end } })
++        local r = one_caption(48)
++        local got = times_of(created[1])
++        check(r.ok == true and created[1].writes == 1, "keyframes/quickfade48: the curve is rewritten", tostring(r.error))
++        check((r.keyframeReport or ""):find("restored", 1, true) == nil, "keyframes/quickfade48: and not put back",
++            tostring(r.keyframeReport))
++        check(same(got, { 6, 14, 16, 44, 47 }), "keyframes/quickfade48: whole frames, the outro ending on frame 47", show(got))
++    end
++    do
++        print("\n=== keyframes: Slow Grow on a 24 frame caption (as placed) ===")
++        multi_pool(51, { { name = "Transform1Size", make = function()
++            return {
++                [17] = { 1, RH = { 9, 0 } },
++                [44] = { 1, LH = { -9, 0 }, RH = { 7.56, 0.28 } },
++                [50] = { 0, LH = { -3.8, 0.02 } },
++            }
++        end } })
++        local r = one_caption(24)
++        local got = times_of(created[1])
++        check(r.ok == true and created[1].writes == 1 and (r.keyframeReport or ""):find("restored", 1, true) == nil,
++            "keyframes/slowgrow24: fitted, not put back", tostring(r.keyframeReport))
++        check(same(got, { 8, 20, 23 }), "keyframes/slowgrow24: the fade out ends on the last frame", show(got))
++    end
++    -- More keyframes than the caption has frames: left as authored rather than stacked.
++    do
++        print("\n=== keyframes: more keyframes than frames ===")
++        multi_pool(100, { { name = "Wiggle", make = function()
++            local kf = {}
++            for t = 0, 99, 9 do kf[t] = { t % 2 } end
++            return kf
++        end } })
++        local r = one_caption(5)
++        check(r.ok == true and created[1].writes == nil, "keyframes/crowded: left as authored", tostring(r.error))
 +    end
 +
 +    -- QUICK FADE: its keyframes run to frame 119 but Resolve says the title is 62 frames long.
@@ -4608,7 +6487,7 @@ index d7006f8..70ab96f 100644
 +        print("\n=== keyframes: evenly spaced keyframes ===")
 +        multi_pool(100, { { name = "Zoom", make = function() return { [0] = { 1 }, [50] = { 1.2 }, [99] = { 1.4 } } end } })
 +        one_caption(40)
-+        check(near(times_of(created[1]), { 0, 20, 39.6 }), "keyframes/even: no clear hold, so squeezed evenly",
++        check(same(times_of(created[1]), { 0, 20, 39 }), "keyframes/even: no clear hold, so squeezed evenly",
 +            show(times_of(created[1])))
 +    end
 +
