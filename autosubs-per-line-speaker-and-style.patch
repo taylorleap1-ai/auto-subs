@@ -129,7 +129,7 @@ index 7bf2e52..e44ff9d 100644
 +const unlabeledCue = [{ ...cue('no speaker here'), speaker_id: undefined }];
 +assert.equal(preserveSubtitleEdits(unlabeledCue, [{ ...unlabeledCue[0], speaker_id: '' }]).changed, false);
 diff --git a/AutoSubs-App/src-tauri/resources/modules/autosubs_core.lua b/AutoSubs-App/src-tauri/resources/modules/autosubs_core.lua
-index 94070f5..f4983c3 100644
+index 94070f5..43a8dc2 100644
 --- a/AutoSubs-App/src-tauri/resources/modules/autosubs_core.lua
 +++ b/AutoSubs-App/src-tauri/resources/modules/autosubs_core.lua
 @@ -1403,6 +1403,73 @@ local function get_template(rootFolder, templateName, timeline)
@@ -259,7 +259,7 @@ index 94070f5..f4983c3 100644
  local function get_speaker_from_id(speakers, id, speakerIndexById)
      local normalizedId = normalize_speaker_id(id)
      if normalizedId == nil then return nil end
-@@ -1533,10 +1646,422 @@ local function get_speaker_from_id(speakers, id, speakerIndexById)
+@@ -1533,10 +1646,452 @@ local function get_speaker_from_id(speakers, id, speakerIndexById)
      return speakers[numericId + 1] or speakers[numericId]
  end
  
@@ -425,43 +425,56 @@ index 94070f5..f4983c3 100644
 +    return times
 +end
 +
-+-- How to move one curve so its animation fits a clip of `clipFrames`. The
-+-- keyframes in the first half of the title are its intro and stay put; those in
-+-- the second half are its outro and move with the end of the clip. When the clip
-+-- is too short for both, the whole animation is squeezed proportionally.
-+--   { op = "none" }                              nothing needs to move
-+--   { op = "offset", first, last, x }            move keyframes first..last by x frames
-+--   { op = "scale", first, last, x }             scale their times by x, around frame 0
-+-- Returns nil when it cannot be fitted.
-+local function plan_fit(times, templateFrames, clipFrames)
-+    if #times == 0 or not templateFrames or templateFrames <= 0 or not clipFrames or clipFrames < 1 then
-+        return nil
-+    end
-+    local half = templateFrames / 2
-+    local lastIntro, firstOutro = nil, nil
-+    for _, time in ipairs(times) do
-+        if time <= half then
-+            lastIntro = time
-+        elseif firstOutro == nil then
-+            firstOutro = time
-+        end
-+    end
-+    if firstOutro == nil then return { op = "none" } end -- an intro only
++-- How to move a title's animation so it fits a clip of `clipFrames`. All of the
++-- title's curves share one plan, so they stay in step with each other.
++--
++-- An animation is usually an intro near the start, a hold, and an outro near the
++-- end. The biggest gap between keyframes (across every curve) is the hold: the
++-- keyframes before it stay with the start of the clip and those after it move
++-- with the end, keeping their distance from it. If the clip is too short to hold
++-- both, or there is no clear hold, the whole animation is squeezed proportionally.
++--   { op = "none" }                        nothing needs to move
++--   { op = "offset", split, x }            keyframes after `split` move by x frames
++--   { op = "scale", x }                    every keyframe time is scaled by x
++-- `templateFrames` is how long the title was authored over; keyframes that run
++-- past it show it was authored longer, so they win. Returns nil if it cannot be fitted.
++local function plan_title_fit(times, templateFrames, clipFrames)
++    if #times == 0 or not clipFrames or clipFrames < 1 then return nil end
++    local first, last = times[1], times[#times]
++    local length = math.max(templateFrames or 0, last + 1)
++    local factor = clipFrames / length
 +
-+    local last = times[#times]
-+    -- The outro keeps its distance from the end, without running past it.
-+    local delta = math.min(clipFrames - templateFrames, clipFrames - 1 - last)
-+    if delta == 0 then return { op = "none" } end
-+    local landing = firstOutro + delta
-+    if landing >= 0 and (lastIntro == nil or landing - lastIntro >= 1) then
-+        return { op = "offset", first = firstOutro, last = last, x = delta }
++    local gapAt, gapSize = nil, 0
++    for i = 1, #times - 1 do
++        local gap = times[i + 1] - times[i]
++        if gap > gapSize then gapAt, gapSize = i, gap end
 +    end
-+    return { op = "scale", first = times[1], last = last, x = clipFrames / templateFrames }
++
++    local shift = clipFrames - length
++    if gapAt and gapSize >= 0.25 * length then
++        -- An intro, a hold and an outro.
++        if shift == 0 then return { op = "none" } end
++        local lastIntro, firstOutro = times[gapAt], times[gapAt + 1]
++        local landing = firstOutro + shift
++        if landing >= 0 and landing - lastIntro >= 1 then
++            return { op = "offset", split = (lastIntro + firstOutro) / 2, x = shift }
++        end
++        return { op = "scale", x = factor }
++    end
++
++    -- No clear hold: every keyframe is close together.
++    if last < 0.5 * length then return { op = "none" } end -- an intro only
++    if first > 0.5 * length then -- an outro only
++        if shift == 0 then return { op = "none" } end
++        if first + shift >= 0 then return { op = "offset", split = first - 0.5, x = shift } end
++        return { op = "scale", x = factor }
++    end
++    return { op = "scale", x = factor } -- runs the whole length: stretch it
 +end
 +
 +-- Where a keyframe at `time` ends up under a plan.
 +local function planned_time(plan, time)
-+    if plan.op == "offset" and time >= plan.first - 1e-6 then return time + plan.x end
++    if plan.op == "offset" and time > plan.split then return time + plan.x end
 +    if plan.op == "scale" then return time * plan.x end
 +    return time
 +end
@@ -564,21 +577,13 @@ index 94070f5..f4983c3 100644
 +    return table.concat(parts, " | ")
 +end
 +
-+-- Move one curve's keyframes. Returns how many it moved, or 0 and a reason.
++-- Move one curve's keyframes under a plan. Returns true, or false and why.
 +-- The result is read back and checked, and the curve is put back as it was if it
 +-- is not right, so a curve is never left damaged.
-+local function fit_spline_keyframes(spline, templateFrames, clipFrames, name, log)
-+    local readOk, original = pcall(function() return spline:GetKeyFrames() end)
-+    if not readOk or type(original) ~= "table" then return 0, "could not read its keyframes" end
-+    local times = keyframe_times(original)
-+    if #times == 0 then return 0 end
-+
-+    local plan = plan_fit(times, templateFrames, clipFrames)
-+    if not plan then return 0, "the clip is too short to hold the animation" end
-+    if plan.op == "none" then return 0 end
-+
++local function fit_one_curve(curve, plan, log)
++    local spline, original = curve.spline, curve.original
 +    local writeOk, writeErr = pcall(rebuild_with_keyframes, spline, original, plan)
-+    if not writeOk then return 0, "could not rewrite the curve: " .. tostring(writeErr) end
++    if not writeOk then return false, "could not rewrite the curve: " .. tostring(writeErr) end
 +
 +    local readBackOk, now = pcall(function() return spline:GetKeyFrames() end)
 +    local good, why
@@ -590,20 +595,31 @@ index 94070f5..f4983c3 100644
 +    if good then
 +        if log and log.remaining > 0 then
 +            log.remaining = log.remaining - 1
-+            report_line(log, string.format("Fitted '%s': %s  ->  %s", name, describe_keyframes(original),
++            report_line(log, string.format("Fitted '%s': %s  ->  %s", curve.name, describe_keyframes(original),
 +                describe_keyframes(now)))
 +        end
-+        return #times
++        return true
 +    end
 +
 +    report_line(log, string.format("Curve '%s' did not come out right (%s), so it was restored.  Before: %s   After: %s",
-+        name, tostring(why), describe_keyframes(original), now and describe_keyframes(now) or "(unreadable)"))
++        curve.name, tostring(why), describe_keyframes(original), now and describe_keyframes(now) or "(unreadable)"))
 +    pcall(function() return spline:SetKeyFrames(original, true) end)
-+    return 0, tostring(why)
++    return false, tostring(why)
 +end
 +
-+-- Fit every animation curve in a title's comp to a clip of `clipSeconds`.
-+-- Returns { curves = n, keyframes = n, reason = first problem or nil }.
++-- What a plan does, in words, for the report.
++local function describe_plan(plan)
++    if plan.op == "offset" then
++        return string.format("the intro stays at the start and the outro moves %+d frames", plan.x)
++    elseif plan.op == "scale" then
++        return string.format("the whole animation is scaled to %.0f%% of its length", plan.x * 100)
++    end
++    return "nothing needs to move"
++end
++
++-- Fit every animation curve in a title's comp to a clip of `clipSeconds`, as one
++-- plan so the curves stay in step. If any curve cannot be fitted, none is left
++-- changed. Returns { curves = n, keyframes = n, reason = first problem or nil }.
 +local function fit_title_keyframes(comp, templateSeconds, clipSeconds, fallbackRate, log)
 +    local result = { curves = 0, keyframes = 0 }
 +    local rateOk, rate = pcall(function() return tonumber(comp:GetPrefs("Comp.FrameFormat.Rate")) end)
@@ -618,47 +634,61 @@ index 94070f5..f4983c3 100644
 +        result.noCurves = true
 +        return result
 +    end
-+    local clipFrames = math.floor(clipSeconds * rate + 0.5)
 +
-+    -- Resolve does not always report a template's length. Without it, assume
-+    -- the outro finishes on the template's last frame.
-+    local templateFrames = templateSeconds and math.floor(templateSeconds * rate + 0.5) or nil
-+    if not templateFrames then
-+        local last = nil
-+        for _, spline in ipairs(splines) do
-+            local readOk, keyframes = pcall(function() return spline:GetKeyFrames() end)
-+            if readOk and type(keyframes) == "table" then
-+                local times = keyframe_times(keyframes)
-+                if #times > 0 and (last == nil or times[#times] > last) then last = times[#times] end
++    local curves, seen = {}, {}
++    for position, spline in ipairs(splines) do
++        local name = "curve " .. position
++        pcall(function()
++            local attrs = spline:GetAttrs()
++            if type(attrs) == "table" and attrs.TOOLS_Name then name = tostring(attrs.TOOLS_Name) end
++        end)
++        local readOk, original = pcall(function() return spline:GetKeyFrames() end)
++        if readOk and type(original) == "table" then
++            local times = keyframe_times(original)
++            if #times > 0 then
++                curves[#curves + 1] = { spline = spline, name = name, original = original, times = times }
++                for _, time in ipairs(times) do seen[time] = true end
 +            end
 +        end
-+        templateFrames = last and math.floor(last + 1.5) or nil
 +    end
-+    if not templateFrames then
-+        result.reason = "could not tell how long the title is"
-+        return result
-+    end
++    if #curves == 0 then return result end
++
++    local allTimes = {}
++    for time in pairs(seen) do allTimes[#allTimes + 1] = time end
++    table.sort(allTimes)
++
++    local clipFrames = math.floor(clipSeconds * rate + 0.5)
++    local templateFrames = templateSeconds and math.floor(templateSeconds * rate + 0.5) or nil
++    local plan = plan_title_fit(allTimes, templateFrames, clipFrames)
 +
 +    if log and log.contextRemaining and log.contextRemaining > 0 then
 +        log.contextRemaining = log.contextRemaining - 1
-+        report_line(log, string.format("Title length: %d frames (%s). Caption: %d frames at %.4g fps. Animation curves found: %d.",
-+            templateFrames, templateSeconds and "reported by Resolve" or "guessed from its last keyframe",
-+            clipFrames, rate, #splines))
++        report_line(log, string.format(
++            "Title length: %s. Caption: %d frames at %.4g fps. Animation curves: %d, keyframes from frame %.2f to %.2f. Plan: %s.",
++            templateFrames and string.format("%d frames (reported by Resolve)", templateFrames) or "not reported by Resolve",
++            clipFrames, rate, #curves, allTimes[1], allTimes[#allTimes],
++            plan and describe_plan(plan) or "the clip is too short to hold the animation"))
 +    end
++    if not plan then
++        result.reason = "the clip is too short to hold the animation"
++        return result
++    end
++    if plan.op == "none" then return result end
 +
-+    for position, spline in ipairs(splines) do
-+        local splineName = "curve " .. position
-+        pcall(function()
-+            local attrs = spline:GetAttrs()
-+            if type(attrs) == "table" and attrs.TOOLS_Name then splineName = tostring(attrs.TOOLS_Name) end
-+        end)
-+        local moved, reason = fit_spline_keyframes(spline, templateFrames, clipFrames, splineName, log)
-+        if moved > 0 then
-+            result.curves = result.curves + 1
-+            result.keyframes = result.keyframes + moved
-+        elseif reason and result.reason == nil then
-+            result.reason = reason
++    local done = {}
++    for _, curve in ipairs(curves) do
++        local fitted, why = fit_one_curve(curve, plan, log)
++        if not fitted then
++            -- Keep the curves in step: put back the ones already moved.
++            for _, earlier in ipairs(done) do
++                pcall(function() return earlier.spline:SetKeyFrames(earlier.original, true) end)
++            end
++            result.reason = why
++            return result
 +        end
++        done[#done + 1] = curve
++        result.curves = result.curves + 1
++        result.keyframes = result.keyframes + #curve.times
 +    end
 +    return result
 +end
@@ -683,7 +713,7 @@ index 94070f5..f4983c3 100644
  end
  
  local function find_subtitle_clips(timeline, transcriptId, subtitles, targetSpeakerId)
-@@ -1641,16 +2166,31 @@ end
+@@ -1641,16 +2196,31 @@ end
  --   skippedBounds      -- count of segments dropped for falling outside the
  --                         timeline (whisper can emit slightly negative starts,
  --                         and transcripts can be longer than the timeline).
@@ -716,7 +746,7 @@ index 94070f5..f4983c3 100644
      for i, subtitle in ipairs(subtitles) do
          -- Skip malformed segments (nil start/end) instead of crashing in to_frames().
          if subtitle["start"] == nil or subtitle["end"] == nil then
-@@ -1677,6 +2217,13 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
+@@ -1677,6 +2247,13 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
          local timeline_pos = timelineStart + start_frame
          local clip_timeline_duration = end_frame - start_frame
  
@@ -730,7 +760,7 @@ index 94070f5..f4983c3 100644
          -- Clips cannot start before the timeline's first frame.
          if timelineEnd and timeline_pos >= timelineEnd or timeline_pos + clip_timeline_duration <= timelineStart then
              skippedBounds = skippedBounds + 1
-@@ -1698,15 +2245,16 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
+@@ -1698,15 +2275,16 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
              local frames_between = timeline_pos - prevClipEnd
              if frames_between < joinThreshold then
                  prevClip.endFrame = math.max(1, math.floor(
@@ -750,7 +780,7 @@ index 94070f5..f4983c3 100644
              mediaType = 1,
              startFrame = 0,
              endFrame = duration,
-@@ -1716,7 +2264,14 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
+@@ -1716,7 +2294,14 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
  
          table.insert(clipList, newClip)
          table.insert(clipSubtitleIndex, i)
@@ -766,7 +796,7 @@ index 94070f5..f4983c3 100644
          ::continue::
      end
  
-@@ -1725,7 +2280,7 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
+@@ -1725,7 +2310,7 @@ local function build_clip_list(subtitles, speakers, speakersExist, trackIndex, t
              skippedBounds))
      end
  
@@ -775,7 +805,7 @@ index 94070f5..f4983c3 100644
  end
  
  -- Applies subtitle text + styling to each appended timeline item. Instead of
-@@ -1736,8 +2291,10 @@ end
+@@ -1736,8 +2321,10 @@ end
  -- caption_style.apply needs it to tell the bundled macro from a user's own
  -- title before running any helper the comp carries.
  local function apply_subtitle_text(timelineItems, clipCount, subtitles, clipSubtitleIndex, speakers,
@@ -787,7 +817,7 @@ index 94070f5..f4983c3 100644
      local failed = 0
      local noFusionComp = 0
      local firstError = nil
-@@ -1771,18 +2328,50 @@ local function apply_subtitle_text(timelineItems, clipCount, subtitles, clipSubt
+@@ -1771,18 +2358,50 @@ local function apply_subtitle_text(timelineItems, clipCount, subtitles, clipSubt
                          speaker = get_speaker_from_id(speakers, subtitle.speaker_id, speakerIndexById)
                      end
  
@@ -842,7 +872,7 @@ index 94070f5..f4983c3 100644
  
                      timelineItem:SetClipColor("Green") -- Visualise updated clips
                  end
-@@ -1805,10 +2394,22 @@ local function apply_subtitle_text(timelineItems, clipCount, subtitles, clipSubt
+@@ -1805,10 +2424,22 @@ local function apply_subtitle_text(timelineItems, clipCount, subtitles, clipSubt
              failed, clipCount, tostring(firstError)))
      end
  
@@ -866,7 +896,7 @@ index 94070f5..f4983c3 100644
  end
  
  -- Add subtitles to the timeline using the specified template
-@@ -1818,6 +2419,11 @@ end
+@@ -1818,6 +2449,11 @@ end
  function AddSubtitles(req)
      local filePath, trackIndex, templateName = req.filePath, req.trackIndex, req.templateName
      local conflictMode, presetSettings = req.conflictMode, req.presetSettings
@@ -878,7 +908,7 @@ index 94070f5..f4983c3 100644
      refresh_project()
      resolve:OpenPage("edit")
  
-@@ -1845,7 +2451,7 @@ function AddSubtitles(req)
+@@ -1845,7 +2481,7 @@ function AddSubtitles(req)
              if not subtitles or #subtitles == 0 then
                  return make_error("Failed to add subtitles", "Transcript has no segments")
              end
@@ -887,7 +917,7 @@ index 94070f5..f4983c3 100644
              local transcriptId = get_transcript_id(data, filePath)
  
              local speakersExist = false
-@@ -1877,9 +2483,15 @@ function AddSubtitles(req)
+@@ -1877,9 +2513,15 @@ function AddSubtitles(req)
                  return make_error("Template not found", templateErr)
              end
  
@@ -906,7 +936,7 @@ index 94070f5..f4983c3 100644
  
              if #clipList == 0 then
                  local reason = skippedBounds > 0 and
-@@ -2059,9 +2671,15 @@ function AddSubtitles(req)
+@@ -2059,9 +2701,15 @@ function AddSubtitles(req)
              if isAnimated and font_fallback then
                  presetSettings, fontSwap = font_fallback.maybe_override(presetSettings, data["language"])
              end
@@ -923,7 +953,7 @@ index 94070f5..f4983c3 100644
              if skippedBounds > 0 then
                  applyStats.failed = applyStats.failed + skippedBounds
                  applyStats.total = applyStats.total + skippedBounds
-@@ -2086,7 +2704,8 @@ function AddSubtitles(req)
+@@ -2086,7 +2734,8 @@ function AddSubtitles(req)
                      total = applyStats.total,
                      noFusionComp = applyStats.noFusionComp,
                      skipped = skippedBounds,
@@ -933,7 +963,7 @@ index 94070f5..f4983c3 100644
                  }
              elseif applyStats and applyStats.failed == applyStats.total and applyStats.total > 0 then
                  local short = string.format("Failed to place all %d subtitles", applyStats.total)
-@@ -2099,7 +2718,7 @@ function AddSubtitles(req)
+@@ -2099,7 +2748,7 @@ function AddSubtitles(req)
                  return make_error(short, applyStats.firstError, errCode)
              end
  
@@ -942,7 +972,7 @@ index 94070f5..f4983c3 100644
          end)() -- end of inner placement function
      end)
  
-@@ -2113,6 +2732,7 @@ end
+@@ -2113,6 +2762,7 @@ end
  
  function BatchApplyStyle(req)
      local filePath, targetSpeakerId, presetSettings = req.filePath, req.targetSpeakerId, req.presetSettings
@@ -950,7 +980,7 @@ index 94070f5..f4983c3 100644
      refresh_project()
  
      local data, loadErr = load_subtitle_data(req)
-@@ -2131,7 +2751,7 @@ function BatchApplyStyle(req)
+@@ -2131,7 +2781,7 @@ function BatchApplyStyle(req)
      end
  
      local speakers = data["speakers"] or {}
@@ -959,7 +989,7 @@ index 94070f5..f4983c3 100644
      local transcriptId = get_transcript_id(data, filePath)
      local matches, discovery = find_subtitle_clips(
          timeline,
-@@ -2144,6 +2764,7 @@ function BatchApplyStyle(req)
+@@ -2144,6 +2794,7 @@ function BatchApplyStyle(req)
      if presetSettings ~= nil and next(presetSettings) ~= nil and font_fallback then
          presetSettings, fontSwap = font_fallback.maybe_override(presetSettings, data["language"])
      end
@@ -967,7 +997,7 @@ index 94070f5..f4983c3 100644
  
      local updated = 0
      local skipped = 0
-@@ -2154,10 +2775,14 @@ function BatchApplyStyle(req)
+@@ -2154,10 +2805,14 @@ function BatchApplyStyle(req)
          local ok, err = pcall(function()
              local didUpdate = false
  
@@ -983,7 +1013,7 @@ index 94070f5..f4983c3 100644
                  if next(clipSettings) ~= nil then
                      caption_style.write(match.comp, match.styleTool, clipSettings)
                      didUpdate = true
-@@ -2203,6 +2828,572 @@ function BatchApplyStyle(req)
+@@ -2203,6 +2858,573 @@ function BatchApplyStyle(req)
      }
  end
  
@@ -1488,8 +1518,9 @@ index 94070f5..f4983c3 100644
 +                            if inputsOk and type(inputs) == "table" then
 +                                for _, input in pairs(inputs) do
 +                                    local outOk, output = pcall(function() return input:GetConnectedOutput() end)
-+                                    if outOk and output then
-+                                        local inputAttrs = attrs_of(input)
++                                    local inputAttrs = attrs_of(input)
++                                    -- Image inputs are just the nodes being wired together.
++                                    if outOk and output and inputAttrs.INPS_DataType ~= "Image" then
 +                                        local inputName = tostring(inputAttrs.INPS_Name or inputAttrs.INPS_ID or "?")
 +                                        local modOk, modifier = pcall(function() return output:GetTool() end)
 +                                        if modOk and modifier then
@@ -1556,7 +1587,7 @@ index 94070f5..f4983c3 100644
  -- Which video track holds this item. Resolve hands back a fresh proxy on each
  -- call, so fall back to the unique id when identity comparison comes up empty.
  local function track_index_of_item(timeline, target)
-@@ -2805,6 +3996,14 @@ local handlers = {
+@@ -2805,6 +4027,14 @@ local handlers = {
          return { message = "Job completed", result = AddSubtitles(req) }
      end,
  
@@ -3444,7 +3475,7 @@ index 0c2f602..eab30de 100644
  
    for (const subtitle of normalizedSubtitles) {
 diff --git a/AutoSubs-App/tests/mock_resolve_test.lua b/AutoSubs-App/tests/mock_resolve_test.lua
-index d7006f8..441f675 100644
+index d7006f8..70ab96f 100644
 --- a/AutoSubs-App/tests/mock_resolve_test.lua
 +++ b/AutoSubs-App/tests/mock_resolve_test.lua
 @@ -23,6 +23,7 @@ local function make_tool()
@@ -3582,7 +3613,7 @@ index d7006f8..441f675 100644
                  table.insert(track.items, item and { handle = item } or nil)
                  results[i] = item
              end
-@@ -747,5 +847,1027 @@ do
+@@ -747,5 +847,1159 @@ do
      check_marker_move(2, 50, 38, "marker move with lead-in")
  end
  
@@ -4459,6 +4490,135 @@ index d7006f8..441f675 100644
 +        local again = sync(captions(1.5), { fitTitleKeyframes = false })
 +        check(again.ok == true and again.unchanged == 3, "keyframes/toggle: a second sync changes nothing", tostring(again.unchanged))
 +    end
++
++    -- ---- The titles reported from a real project --------------------------------------------
++    -- Each is placed on a single caption of `frames` frames; `defs` lists the curves on its comp.
++    local function multi_pool(titleFrames, defs)
++        fresh({ extraClips = { "Big Yellow" }, titleFrames = { ["Big Yellow"] = titleFrames } })
++        mp.bareTitles = true
++        created = {}
++        mp.titleSplines = function()
++            local list = {}
++            for _, def in ipairs(defs) do
++                local sp = make_spline(def.make(), def.name)
++                if def.failWrite then sp.failWrite = true end
++                list[#list + 1] = sp
++                created[#created + 1] = sp
++            end
++            return list
++        end
++    end
++    local function one_caption(frames, extra) return send({ seg(0, 0, frames / 24) }, extra) end
++
++    local function punch_in_size()
++        return {
++            [14] = { 0, RH = { 9, 1.59 } },
++            [25] = { 0.98, LH = { -6.3, 0.005 }, RH = { 21.67, 3.33e-16 } },
++            [90] = { 0.98, LH = { -21.67, -3.33e-16 }, RH = { 2.5, 0.26 } },
++            [97] = { 0, LH = { -5, 0.46 } },
++        }
++    end
++    local function punch_in_angle()
++        return { [90] = { 0, RH = { 2.33, 2.6 } }, [97] = { 7.8, LH = { -2.33, -2.6 } } }
++    end
++    local punch_in = {
++        { name = "Transform1Size", make = punch_in_size },
++        { name = "Transform1Angle", make = punch_in_angle },
++    }
++
++    -- PUNCH IN / FADE OUT: Size and Angle must move together, by the same amount.
++    do
++        print("\n=== keyframes: Punch In/Fade Out (two curves) ===")
++        multi_pool(97, punch_in)
++        local r = one_caption(113)
++        check(r.ok == true and #created == 2, "keyframes/punchin: sent", tostring(r.error))
++        local size, angle = created[1], created[2]
++        check(same(times_of(size), { 14, 25, 105, 112 }), "keyframes/punchin: Size keeps its intro, outro moves to the end", show(times_of(size)))
++        check(same(times_of(angle), { 105, 112 }), "keyframes/punchin: Angle moves by the same amount", show(times_of(angle)))
++        check(handle_is(size._kf[112].LH, -5, 0.46) and handle_is(size._kf[105].RH, 2.5, 0.26)
++            and handle_is(angle._kf[112].LH, -2.33, -2.6), "keyframes/punchin: every handle keeps its numbers")
++        check(size.adjusts == 0 and angle.adjusts == 0, "keyframes/punchin: Fusion's AdjustKeyFrames is not used")
++        check((r.keyframeReport or ""):find("Plan: the intro stays at the start and the outro moves +15 frames", 1, true) ~= nil,
++            "keyframes/punchin: the report says what it did", tostring(r.keyframeReport))
++    end
++    -- ...and when the caption is too short for both, both are squeezed by the same factor.
++    do
++        print("\n=== keyframes: Punch In/Fade Out, a very short caption ===")
++        multi_pool(97, punch_in)
++        one_caption(20)
++        local size, angle = times_of(created[1]), times_of(created[2])
++        local factor = 20 / 98
++        check(near(size, { 14 * factor, 25 * factor, 90 * factor, 97 * factor }),
++            "keyframes/punchin-short: Size squeezed", show(size))
++        check(near(angle, { 90 * factor, 97 * factor }), "keyframes/punchin-short: Angle squeezed by the same factor", show(angle))
++    end
++
++    -- QUICK FADE: its keyframes run to frame 119 but Resolve says the title is 62 frames long.
++    do
++        print("\n=== keyframes: Quick Fade (keyframes past the reported length) ===")
++        multi_pool(62, { { name = "Transform1Size", make = function()
++            return {
++                [35] = { 0, RH = { 3.5, 1.38 } },
++                [40] = { 1.01, LH = { -2.2, 0.0139 }, RH = { 24, -0.00205 } },
++                [112] = { 1, LH = { -24, 0.00205 }, RH = { 7, -0.004 } },
++                [119] = { 0, LH = { 0, 1.32 } },
++            }
++        end } })
++        local r = one_caption(113)
++        check(r.ok == true, "keyframes/quickfade: sent", tostring(r.error))
++        check(same(times_of(created[1]), { 35, 40, 105, 112 }), "keyframes/quickfade: authored length trusted over the reported one",
++            show(times_of(created[1])))
++        check(handle_is(created[1]._kf[112].LH, 0, 1.32), "keyframes/quickfade: handles unchanged")
++    end
++
++    -- SWIPE DOWN: an intro only. It stays at the start however long the caption is.
++    do
++        print("\n=== keyframes: Swipe Down (intro only) ===")
++        local function swipe() return { [0] = { 2.32e-07, RH = { 0, 1.6 } }, [7] = { 1, LH = { -7.94, -0.005 } } } end
++        for _, frames in ipairs({ 113, 20 }) do
++            multi_pool(68, { { name = "Transform1Size", make = swipe } })
++            local r = one_caption(frames)
++            check(r.ok == true and created[1].writes == nil and same(times_of(created[1]), { 0, 7 }),
++                "keyframes/swipe: left alone on a " .. frames .. " frame caption", tostring(r.error) .. " " .. show(times_of(created[1])))
++        end
++    end
++
++    -- All curves or none: if one cannot be written, the others are put back too.
++    do
++        print("\n=== keyframes: one curve of two refuses ===")
++        multi_pool(97, {
++            { name = "Transform1Size", make = punch_in_size },
++            { name = "Transform1Angle", make = punch_in_angle, failWrite = true },
++        })
++        local r = one_caption(113)
++        check(r.ok == true and (r.failed or 0) == 0, "keyframes/partial: the send still succeeds", tostring(r.error))
++        check(same(times_of(created[1]), { 14, 25, 90, 97 }) and same(times_of(created[2]), { 90, 97 }),
++            "keyframes/partial: neither curve is left half-moved", show(times_of(created[1])) .. show(times_of(created[2])))
++    end
++
++    -- An animation that runs the whole length is stretched.
++    do
++        print("\n=== keyframes: an animation across the whole title ===")
++        multi_pool(100, { { name = "Zoom", make = function() return { [0] = { 1 }, [99] = { 1.4 } } end } })
++        one_caption(40)
++        check(same(times_of(created[1]), { 0, 39 }), "keyframes/grow: its end moves to the end of the caption",
++            show(times_of(created[1])))
++    end
++    do
++        print("\n=== keyframes: evenly spaced keyframes ===")
++        multi_pool(100, { { name = "Zoom", make = function() return { [0] = { 1 }, [50] = { 1.2 }, [99] = { 1.4 } } end } })
++        one_caption(40)
++        check(near(times_of(created[1]), { 0, 20, 39.6 }), "keyframes/even: no clear hold, so squeezed evenly",
++            show(times_of(created[1])))
++    end
++
++    -- A title that only has an outro.
++    do
++        print("\n=== keyframes: an outro only ===")
++        multi_pool(97, { { name = "Transform1Angle", make = punch_in_angle } })
++        one_caption(113)
++        check(same(times_of(created[1]), { 105, 112 }), "keyframes/outro: moves with the end of the caption", show(times_of(created[1])))
++    end
 +end
 +
 +-- InspectTitle: report how a title is built and animated ------------------------
@@ -4472,7 +4632,7 @@ index d7006f8..441f675 100644
 +                GetAttrs = function() return { TOOLS_RegID = driver.kind, TOOLS_Name = driver.name } end,
 +            }
 +            inputs[#inputs + 1] = {
-+                GetAttrs = function() return { INPS_Name = inputName, INPS_ID = inputName } end,
++                GetAttrs = function() return { INPS_Name = inputName, INPS_ID = inputName, INPS_DataType = driver.image and "Image" or "Number" } end,
 +                GetConnectedOutput = function() return { GetTool = function() return modifier end } end,
 +                GetKeyFrames = function()
 +                    local out = {}
@@ -4528,6 +4688,7 @@ index d7006f8..441f675 100644
 +            make_tool("MediaIn1", "MediaIn"),
 +            make_tool("Template", "TextPlus"),
 +            make_tool("Transform1", "Transform", {
++                Input = { kind = "TextPlus", name = "Template", times = { 0, 99 }, image = true },
 +                Size = { spline = punch },
 +                Center = { kind = "XYPath", name = "Path1", times = { 0, 40, 98 } },
 +            }),
@@ -4553,6 +4714,8 @@ index d7006f8..441f675 100644
 +            and report:find("Zoom is driven by BezierSpline 'ResolveFXZoom': 2 keyframes", 1, true) ~= nil,
 +            "inspect/full: reads an OpenFX tool's animation too", report)
 +        check(report:find("Blend is driven", 1, true) == nil, "inspect/full: leaves unanimated inputs out")
++        check(report:find("driven by Transform", 1, true) == nil and report:find("driven by TextPlus", 1, true) == nil,
++            "inspect/full: leaves plain image links between nodes out", report)
 +        check(report:find("Edit page Inspector", 1, true) ~= nil, "inspect/full: says what it cannot read")
 +    end
 +
